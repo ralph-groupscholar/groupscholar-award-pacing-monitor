@@ -1,0 +1,29 @@
+# Group Scholar Award Pacing Monitor
+
+A Swift CLI for tracking scholarship award disbursement pacing against an annual budget. It summarizes monthly or quarterly spend, highlights variance from linear pacing, and projects future periods based on recent averages.
+
+## Features
+- Parses award CSVs (date, amount, category, cohort)
+- Monthly or quarterly pacing views
+- Variance vs expected linear spend
+- Simple forward projection based on the last three periods
+- Pacing alerts for periods outside the target range
+- Current-year snapshot with projected year-end burn vs budget
+- Top category and cohort spend mix
+
+## Usage
+
+```sh
+swift run groupscholar-award-pacing-monitor --file sample/awards.csv --budget 240000 --period month --projection-periods 4
+```
+
+### CSV format
+
+```csv
+date,amount,category,cohort
+2025-09-15,12000,Tuition,Fall 2025
+```
+
+## Notes
+- Dates must be `YYYY-MM-DD`.
+- The annual budget is treated as evenly distributed across the selected period type.

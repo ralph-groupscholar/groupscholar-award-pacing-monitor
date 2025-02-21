@@ -1,0 +1,9 @@
+# Group Scholar Award Pacing Monitor Progress
+
+## Iteration 1
+- Bootstrapped a Swift CLI with CSV parsing, pacing summaries, and projection logic.
+- Added a sample awards CSV and documented usage in the README.
+
+## Iteration 2
+- Added pacing alerts for out-of-range periods, plus top category and cohort mix breakdowns.
+- Expanded the report output to surface the most material deviations and mixes.
