@@ -5,6 +5,10 @@ struct Config {
     let annualBudget: Double
     let period: PeriodType
     let projectionPeriods: Int
+    let startDate: Date?
+    let endDate: Date?
+    let categoryFilters: [String]
+    let cohortFilters: [String]
 }
 
 enum PeriodType: String {
@@ -37,7 +41,12 @@ struct groupscholar_award_pacing_monitor {
                 print("No award records found.")
                 return
             }
-            let summary = buildSummary(records: records, config: config)
+            let filtered = applyFilters(records: records, config: config)
+            if filtered.isEmpty {
+                print("No award records found after applying filters.")
+                return
+            }
+            let summary = buildSummary(records: filtered, config: config)
             printReport(summary: summary, config: config)
         } catch {
             fputs("Error: \(error)\n", stderr)
@@ -52,6 +61,10 @@ func parseArgs(_ args: [String]) throws -> Config {
     var budget: Double?
     var period: PeriodType = .month
     var projectionPeriods = 0
+    var startDate: Date?
+    var endDate: Date?
+    var categoryFilters: [String] = []
+    var cohortFilters: [String] = []
 
     var index = 0
     while index < args.count {
@@ -78,6 +91,24 @@ func parseArgs(_ args: [String]) throws -> Config {
             guard index < args.count else { throw ArgError.missingValue("--projection-periods") }
             guard let value = Int(args[index]) else { throw ArgError.invalidValue("--projection-periods") }
             projectionPeriods = max(0, value)
+        case "--start-date":
+            index += 1
+            guard index < args.count else { throw ArgError.missingValue("--start-date") }
+            guard let parsed = parseDate(args[index]) else { throw ArgError.invalidValue("--start-date") }
+            startDate = buildDate(year: parsed.year, month: parsed.month, day: parsed.day)
+        case "--end-date":
+            index += 1
+            guard index < args.count else { throw ArgError.missingValue("--end-date") }
+            guard let parsed = parseDate(args[index]) else { throw ArgError.invalidValue("--end-date") }
+            endDate = buildDate(year: parsed.year, month: parsed.month, day: parsed.day)
+        case "--category":
+            index += 1
+            guard index < args.count else { throw ArgError.missingValue("--category") }
+            categoryFilters = parseFilterList(args[index])
+        case "--cohort":
+            index += 1
+            guard index < args.count else { throw ArgError.missingValue("--cohort") }
+            cohortFilters = parseFilterList(args[index])
         case "--help", "-h":
             printUsage()
             exit(0)
@@ -90,7 +121,16 @@ func parseArgs(_ args: [String]) throws -> Config {
     guard let filePathUnwrapped = filePath else { throw ArgError.missingRequired("--file") }
     guard let budgetUnwrapped = budget else { throw ArgError.missingRequired("--budget") }
 
-    return Config(filePath: filePathUnwrapped, annualBudget: budgetUnwrapped, period: period, projectionPeriods: projectionPeriods)
+    return Config(
+        filePath: filePathUnwrapped,
+        annualBudget: budgetUnwrapped,
+        period: period,
+        projectionPeriods: projectionPeriods,
+        startDate: startDate,
+        endDate: endDate,
+        categoryFilters: categoryFilters,
+        cohortFilters: cohortFilters
+    )
 }
 
 enum ArgError: Error, CustomStringConvertible {
@@ -119,9 +159,10 @@ func printUsage() {
 
     Usage:
       award-pacing --file <csv> --budget <annual_budget> [--period month|quarter] [--projection-periods N]
+                   [--start-date YYYY-MM-DD] [--end-date YYYY-MM-DD] [--category list] [--cohort list]
 
     Example:
-      swift run award-pacing --file sample/awards.csv --budget 240000 --period month --projection-periods 4
+      swift run award-pacing --file sample/awards.csv --budget 240000 --period month --projection-periods 4 --start-date 2025-01-01 --category Tuition,Stipend
     """
     print(usage)
 }
@@ -180,11 +221,47 @@ func parseDate(_ value: String) -> (year: Int, month: Int, day: Int)? {
     return (year, month, day)
 }
 
+func buildDate(year: Int, month: Int, day: Int) -> Date? {
+    let calendar = Calendar(identifier: .gregorian)
+    return calendar.date(from: DateComponents(year: year, month: month, day: day))
+}
+
+func parseFilterList(_ raw: String) -> [String] {
+    raw.split(separator: ",")
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+        .filter { !$0.isEmpty }
+}
+
+func recordDate(_ record: Record) -> Date? {
+    buildDate(year: record.year, month: record.month, day: record.day)
+}
+
+func applyFilters(records: [Record], config: Config) -> [Record] {
+    let normalizedCategoryFilters = Set(config.categoryFilters)
+    let normalizedCohortFilters = Set(config.cohortFilters)
+
+    return records.filter { record in
+        guard let date = recordDate(record) else { return false }
+        if let start = config.startDate, date < start { return false }
+        if let end = config.endDate, date > end { return false }
+        if !normalizedCategoryFilters.isEmpty {
+            let category = record.category.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if !normalizedCategoryFilters.contains(category) { return false }
+        }
+        if !normalizedCohortFilters.isEmpty {
+            let cohort = record.cohort.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if !normalizedCohortFilters.contains(cohort) { return false }
+        }
+        return true
+    }
+}
+
 struct Summary {
     let totalRecords: Int
     let totalAmount: Double
     let periodTotals: [String: Double]
     let periodEntries: [PeriodEntry]
+    let missingPeriods: [PeriodEntry]
     let expectedPerPeriod: Double
     let periodType: PeriodType
     let startDate: Date
@@ -195,6 +272,7 @@ struct Summary {
     let paceFlags: [PaceFlag]
     let yearTotals: [Int: Double]
     let yearPeriods: [Int: Set<String>]
+    let periodDeltas: [PeriodDelta]
 }
 
 struct PaceFlag {
@@ -203,6 +281,13 @@ struct PaceFlag {
     let expected: Double
     let variance: Double
     let pace: Double
+}
+
+struct PeriodDelta {
+    let from: PeriodEntry
+    let to: PeriodEntry
+    let delta: Double
+    let percent: Double?
 }
 
 func buildSummary(records: [Record], config: Config) -> Summary {
@@ -235,6 +320,8 @@ func buildSummary(records: [Record], config: Config) -> Summary {
     let expectedPerPeriod: Double = config.period == .month ? config.annualBudget / 12.0 : config.annualBudget / 4.0
 
     let orderedEntries = entries.values.sorted { $0.date < $1.date }
+    let missingPeriods = buildMissingPeriods(entries: orderedEntries, totals: periodTotals, period: config.period)
+    let periodDeltas = buildPeriodDeltas(entries: orderedEntries, totals: periodTotals)
     let projection = buildProjection(entries: orderedEntries, totals: periodTotals, config: config)
     let paceFlags = buildPaceFlags(entries: orderedEntries, totals: periodTotals, expectedPerPeriod: expectedPerPeriod)
 
@@ -243,6 +330,7 @@ func buildSummary(records: [Record], config: Config) -> Summary {
         totalAmount: periodTotals.values.reduce(0, +),
         periodTotals: periodTotals,
         periodEntries: orderedEntries,
+        missingPeriods: missingPeriods,
         expectedPerPeriod: expectedPerPeriod,
         periodType: config.period,
         startDate: minDate,
@@ -252,7 +340,8 @@ func buildSummary(records: [Record], config: Config) -> Summary {
         cohortTotals: cohortTotals,
         paceFlags: paceFlags,
         yearTotals: yearTotals,
-        yearPeriods: yearPeriods
+        yearPeriods: yearPeriods,
+        periodDeltas: periodDeltas
     )
 }
 
@@ -287,6 +376,34 @@ func buildProjection(entries: [PeriodEntry], totals: [String: Double], config: C
         projected[cursor] = average
     }
     return projected
+}
+
+func buildMissingPeriods(entries: [PeriodEntry], totals: [String: Double], period: PeriodType) -> [PeriodEntry] {
+    guard let first = entries.first, let last = entries.last else { return [] }
+    var missing: [PeriodEntry] = []
+    var cursor = first
+    while cursor.date <= last.date {
+        if totals[cursor.key] == nil {
+            missing.append(cursor)
+        }
+        cursor = nextPeriod(from: cursor, period: period)
+    }
+    return missing
+}
+
+func buildPeriodDeltas(entries: [PeriodEntry], totals: [String: Double]) -> [PeriodDelta] {
+    guard entries.count > 1 else { return [] }
+    var deltas: [PeriodDelta] = []
+    for index in 1..<entries.count {
+        let previous = entries[index - 1]
+        let current = entries[index]
+        let previousAmount = totals[previous.key] ?? 0
+        let currentAmount = totals[current.key] ?? 0
+        let delta = currentAmount - previousAmount
+        let percent = previousAmount != 0 ? delta / previousAmount : nil
+        deltas.append(PeriodDelta(from: previous, to: current, delta: delta, percent: percent))
+    }
+    return deltas
 }
 
 func nextPeriod(from entry: PeriodEntry, period: PeriodType) -> PeriodEntry {
@@ -332,6 +449,23 @@ func printReport(summary: Summary, config: Config) {
     print(String(format: "Total spent: $%.2f", summary.totalAmount))
     print(String(format: "Expected (%.0f periods): $%.2f", Double(totalPeriods), expectedTotal))
     print(String(format: "Variance: $%.2f", variance))
+
+    if config.startDate != nil || config.endDate != nil || !config.categoryFilters.isEmpty || !config.cohortFilters.isEmpty {
+        print("")
+        print("Filters")
+        if let start = config.startDate {
+            print("Start date: \(formatter.string(from: start))")
+        }
+        if let end = config.endDate {
+            print("End date: \(formatter.string(from: end))")
+        }
+        if !config.categoryFilters.isEmpty {
+            print("Categories: \(config.categoryFilters.joined(separator: ", "))")
+        }
+        if !config.cohortFilters.isEmpty {
+            print("Cohorts: \(config.cohortFilters.joined(separator: ", "))")
+        }
+    }
     print("")
 
     print("Period Breakdown")
@@ -344,6 +478,34 @@ func printReport(summary: Summary, config: Config) {
         let pace = summary.expectedPerPeriod > 0 ? actual / summary.expectedPerPeriod : 0
         let row = String(format: "%-10@ | $%-11.2f | $%-11.2f | %-7.0f%%", entry.key as NSString, actual, summary.expectedPerPeriod, pace * 100)
         print(row)
+    }
+
+    if !summary.missingPeriods.isEmpty {
+        print("")
+        print("Missing Periods")
+        print("Count: \(summary.missingPeriods.count)")
+        let list = summary.missingPeriods.prefix(6).map { $0.key }.joined(separator: ", ")
+        print(list)
+        if summary.missingPeriods.count > 6 {
+            print("...and \(summary.missingPeriods.count - 6) more")
+        }
+    }
+
+    let increases = summary.periodDeltas.filter { $0.delta > 0 }.sorted { $0.delta > $1.delta }
+    let decreases = summary.periodDeltas.filter { $0.delta < 0 }.sorted { $0.delta < $1.delta }
+    if !increases.isEmpty || !decreases.isEmpty {
+        print("")
+        print("Largest Period Swings")
+        for delta in increases.prefix(3) {
+            let percent = delta.percent.map { String(format: " (%.0f%%)", $0 * 100) } ?? ""
+            let row = String(format: "+ $%-10.2f | %@ -> %@%@", delta.delta, delta.from.key, delta.to.key, percent)
+            print(row)
+        }
+        for delta in decreases.prefix(3) {
+            let percent = delta.percent.map { String(format: " (%.0f%%)", $0 * 100) } ?? ""
+            let row = String(format: "- $%-10.2f | %@ -> %@%@", abs(delta.delta), delta.from.key, delta.to.key, percent)
+            print(row)
+        }
     }
 
     if !summary.projection.isEmpty {

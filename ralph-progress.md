@@ -7,3 +7,7 @@
 ## Iteration 2
 - Added pacing alerts for out-of-range periods, plus top category and cohort mix breakdowns.
 - Expanded the report output to surface the most material deviations and mixes.
+
+## Iteration 3
+- Added missing period detection across the reporting window.
+- Added period-over-period swing highlights for the largest increases and decreases.

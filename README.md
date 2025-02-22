@@ -8,6 +8,8 @@ A Swift CLI for tracking scholarship award disbursement pacing against an annual
 - Variance vs expected linear spend
 - Simple forward projection based on the last three periods
 - Pacing alerts for periods outside the target range
+- Missing period detection across the reporting window
+- Largest period-over-period swing highlights
 - Current-year snapshot with projected year-end burn vs budget
 - Top category and cohort spend mix
 
