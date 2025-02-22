@@ -11,3 +11,7 @@
 ## Iteration 3
 - Added missing period detection across the reporting window.
 - Added period-over-period swing highlights for the largest increases and decreases.
+
+## Iteration 3
+- Added optional date, category, and cohort filters to focus pacing analysis on specific slices.
+- Included filter summaries in CLI output and updated README with new usage examples.
