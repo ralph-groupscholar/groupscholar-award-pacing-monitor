@@ -158,11 +158,11 @@ func printUsage() {
     Group Scholar Award Pacing Monitor
 
     Usage:
-      award-pacing --file <csv> --budget <annual_budget> [--period month|quarter] [--projection-periods N]
+      groupscholar-award-pacing-monitor --file <csv> --budget <annual_budget> [--period month|quarter] [--projection-periods N]
                    [--start-date YYYY-MM-DD] [--end-date YYYY-MM-DD] [--category list] [--cohort list]
 
     Example:
-      swift run award-pacing --file sample/awards.csv --budget 240000 --period month --projection-periods 4 --start-date 2025-01-01 --category Tuition,Stipend
+      swift run groupscholar-award-pacing-monitor --file sample/awards.csv --budget 240000 --period month --projection-periods 4 --start-date 2025-01-01 --category Tuition,Stipend
     """
     print(usage)
 }
