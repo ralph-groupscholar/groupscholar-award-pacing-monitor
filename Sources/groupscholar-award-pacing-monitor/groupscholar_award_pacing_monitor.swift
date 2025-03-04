@@ -9,6 +9,7 @@ struct Config {
     let endDate: Date?
     let categoryFilters: [String]
     let cohortFilters: [String]
+    let exportPath: String?
 }
 
 enum PeriodType: String {
@@ -48,6 +49,11 @@ struct groupscholar_award_pacing_monitor {
             }
             let summary = buildSummary(records: filtered, config: config)
             printReport(summary: summary, config: config)
+            if let exportPath = config.exportPath {
+                try exportReport(summary: summary, config: config, to: exportPath)
+                print("")
+                print("Exported JSON report to \(exportPath)")
+            }
         } catch {
             fputs("Error: \(error)\n", stderr)
             printUsage()
@@ -65,6 +71,7 @@ func parseArgs(_ args: [String]) throws -> Config {
     var endDate: Date?
     var categoryFilters: [String] = []
     var cohortFilters: [String] = []
+    var exportPath: String?
 
     var index = 0
     while index < args.count {
@@ -109,6 +116,10 @@ func parseArgs(_ args: [String]) throws -> Config {
             index += 1
             guard index < args.count else { throw ArgError.missingValue("--cohort") }
             cohortFilters = parseFilterList(args[index])
+        case "--export-json":
+            index += 1
+            guard index < args.count else { throw ArgError.missingValue("--export-json") }
+            exportPath = args[index]
         case "--help", "-h":
             printUsage()
             exit(0)
@@ -129,7 +140,8 @@ func parseArgs(_ args: [String]) throws -> Config {
         startDate: startDate,
         endDate: endDate,
         categoryFilters: categoryFilters,
-        cohortFilters: cohortFilters
+        cohortFilters: cohortFilters,
+        exportPath: exportPath
     )
 }
 
@@ -159,10 +171,10 @@ func printUsage() {
 
     Usage:
       groupscholar-award-pacing-monitor --file <csv> --budget <annual_budget> [--period month|quarter] [--projection-periods N]
-                   [--start-date YYYY-MM-DD] [--end-date YYYY-MM-DD] [--category list] [--cohort list]
+                   [--start-date YYYY-MM-DD] [--end-date YYYY-MM-DD] [--category list] [--cohort list] [--export-json path]
 
     Example:
-      swift run groupscholar-award-pacing-monitor --file sample/awards.csv --budget 240000 --period month --projection-periods 4 --start-date 2025-01-01 --category Tuition,Stipend
+      swift run groupscholar-award-pacing-monitor --file sample/awards.csv --budget 240000 --period month --projection-periods 4 --start-date 2025-01-01 --category Tuition,Stipend --export-json out/report.json
     """
     print(usage)
 }
@@ -290,6 +302,76 @@ struct PeriodDelta {
     let percent: Double?
 }
 
+struct CumulativeEntry {
+    let entry: PeriodEntry
+    let actual: Double
+    let expected: Double
+    let variance: Double
+}
+
+struct ExportPayload: Encodable {
+    let generatedAt: String
+    let periodType: String
+    let annualBudget: Double
+    let dateRange: ExportDateRange
+    let filters: ExportFilters
+    let totals: ExportTotals
+    let periods: [ExportPeriod]
+    let missingPeriods: [String]
+    let paceAlerts: [ExportPaceAlert]
+    let projection: [ExportProjection]
+    let topCategories: [ExportBreakdown]
+    let topCohorts: [ExportBreakdown]
+}
+
+struct ExportDateRange: Encodable {
+    let start: String
+    let end: String
+}
+
+struct ExportFilters: Encodable {
+    let startDate: String?
+    let endDate: String?
+    let categories: [String]
+    let cohorts: [String]
+}
+
+struct ExportTotals: Encodable {
+    let records: Int
+    let actual: Double
+    let expected: Double
+    let variance: Double
+}
+
+struct ExportPeriod: Encodable {
+    let key: String
+    let actual: Double
+    let expected: Double
+    let pace: Double
+    let cumulativeActual: Double
+    let cumulativeExpected: Double
+    let cumulativeVariance: Double
+}
+
+struct ExportPaceAlert: Encodable {
+    let period: String
+    let actual: Double
+    let expected: Double
+    let variance: Double
+    let pace: Double
+}
+
+struct ExportProjection: Encodable {
+    let period: String
+    let amount: Double
+}
+
+struct ExportBreakdown: Encodable {
+    let name: String
+    let amount: Double
+    let share: Double
+}
+
 func buildSummary(records: [Record], config: Config) -> Summary {
     let calendar = Calendar(identifier: .gregorian)
     var periodTotals: [String: Double] = [:]
@@ -406,6 +488,21 @@ func buildPeriodDeltas(entries: [PeriodEntry], totals: [String: Double]) -> [Per
     return deltas
 }
 
+func buildCumulative(entries: [PeriodEntry], totals: [String: Double], expectedPerPeriod: Double) -> [CumulativeEntry] {
+    var cumulativeActual = 0.0
+    var results: [CumulativeEntry] = []
+
+    for entry in entries {
+        let actual = totals[entry.key] ?? 0
+        cumulativeActual += actual
+        let cumulativeExpected = expectedPerPeriod * Double(results.count + 1)
+        let variance = cumulativeActual - cumulativeExpected
+        results.append(CumulativeEntry(entry: entry, actual: cumulativeActual, expected: cumulativeExpected, variance: variance))
+    }
+
+    return results
+}
+
 func nextPeriod(from entry: PeriodEntry, period: PeriodType) -> PeriodEntry {
     let calendar = Calendar(identifier: .gregorian)
     let monthIncrement = period == .month ? 1 : 3
@@ -433,6 +530,73 @@ func buildPaceFlags(entries: [PeriodEntry], totals: [String: Double], expectedPe
     }
 
     return flags.sorted { abs($0.variance) > abs($1.variance) }
+}
+
+func exportReport(summary: Summary, config: Config, to path: String) throws {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd"
+    formatter.timeZone = TimeZone(secondsFromGMT: 0)
+
+    let totalPeriods = summary.periodEntries.count
+    let expectedTotal = summary.expectedPerPeriod * Double(totalPeriods)
+    let variance = summary.totalAmount - expectedTotal
+
+    let cumulative = buildCumulative(entries: summary.periodEntries, totals: summary.periodTotals, expectedPerPeriod: summary.expectedPerPeriod)
+    let periods: [ExportPeriod] = summary.periodEntries.enumerated().map { index, entry in
+        let actual = summary.periodTotals[entry.key] ?? 0
+        let pace = summary.expectedPerPeriod > 0 ? actual / summary.expectedPerPeriod : 0
+        let cumulativeEntry = cumulative[index]
+        return ExportPeriod(
+            key: entry.key,
+            actual: actual,
+            expected: summary.expectedPerPeriod,
+            pace: pace,
+            cumulativeActual: cumulativeEntry.actual,
+            cumulativeExpected: cumulativeEntry.expected,
+            cumulativeVariance: cumulativeEntry.variance
+        )
+    }
+
+    let projections = summary.projection.keys.sorted(by: { $0.date < $1.date }).compactMap { entry -> ExportProjection? in
+        guard let amount = summary.projection[entry] else { return nil }
+        return ExportProjection(period: entry.key, amount: amount)
+    }
+
+    let payload = ExportPayload(
+        generatedAt: formatter.string(from: Date()),
+        periodType: summary.periodType.rawValue,
+        annualBudget: config.annualBudget,
+        dateRange: ExportDateRange(
+            start: formatter.string(from: summary.startDate),
+            end: formatter.string(from: summary.endDate)
+        ),
+        filters: ExportFilters(
+            startDate: config.startDate.map { formatter.string(from: $0) },
+            endDate: config.endDate.map { formatter.string(from: $0) },
+            categories: config.categoryFilters,
+            cohorts: config.cohortFilters
+        ),
+        totals: ExportTotals(
+            records: summary.totalRecords,
+            actual: summary.totalAmount,
+            expected: expectedTotal,
+            variance: variance
+        ),
+        periods: periods,
+        missingPeriods: summary.missingPeriods.map { $0.key },
+        paceAlerts: summary.paceFlags.map {
+            ExportPaceAlert(period: $0.period, actual: $0.actual, expected: $0.expected, variance: $0.variance, pace: $0.pace)
+        },
+        projection: projections,
+        topCategories: buildBreakdownEntries(totals: summary.categoryTotals, totalAmount: summary.totalAmount),
+        topCohorts: buildBreakdownEntries(totals: summary.cohortTotals, totalAmount: summary.totalAmount)
+    )
+
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let data = try encoder.encode(payload)
+    let url = URL(fileURLWithPath: path)
+    try data.write(to: url)
 }
 
 func printReport(summary: Summary, config: Config) {
@@ -478,6 +642,19 @@ func printReport(summary: Summary, config: Config) {
         let pace = summary.expectedPerPeriod > 0 ? actual / summary.expectedPerPeriod : 0
         let row = String(format: "%-10@ | $%-11.2f | $%-11.2f | %-7.0f%%", entry.key as NSString, actual, summary.expectedPerPeriod, pace * 100)
         print(row)
+    }
+
+    let cumulative = buildCumulative(entries: summary.periodEntries, totals: summary.periodTotals, expectedPerPeriod: summary.expectedPerPeriod)
+    if !cumulative.isEmpty {
+        print("")
+        print("Cumulative Pace")
+        let header = String(format: "%-10@ | %-12@ | %-12@ | %-12@", "Period" as NSString, "Actual" as NSString, "Expected" as NSString, "Variance" as NSString)
+        print(header)
+        print(String(repeating: "-", count: 56))
+        for entry in cumulative {
+            let row = String(format: "%-10@ | $%-11.2f | $%-11.2f | $%-11.2f", entry.entry.key as NSString, entry.actual, entry.expected, entry.variance)
+            print(row)
+        }
     }
 
     if !summary.missingPeriods.isEmpty {
@@ -574,4 +751,13 @@ func topBreakdown(title: String, totals: [String: Double], totalAmount: Double) 
         lines.append(String(format: "%2d. %-20@ $%-10.2f (%.1f%%)", index + 1, entry.key as NSString, entry.value, share))
     }
     return lines.joined(separator: "\n")
+}
+
+func buildBreakdownEntries(totals: [String: Double], totalAmount: Double) -> [ExportBreakdown] {
+    guard totalAmount > 0, !totals.isEmpty else { return [] }
+    let sorted = totals.sorted { $0.value > $1.value }
+    return sorted.prefix(5).map { entry in
+        let share = (entry.value / totalAmount) * 100
+        return ExportBreakdown(name: entry.key, amount: entry.value, share: share)
+    }
 }

@@ -15,3 +15,7 @@
 ## Iteration 3
 - Added optional date, category, and cohort filters to focus pacing analysis on specific slices.
 - Included filter summaries in CLI output and updated README with new usage examples.
+
+## Iteration 4
+- Added cumulative pacing breakdowns to surface running variance against expected spend.
+- Added JSON export for downstream reporting and updated CLI usage/README.
