@@ -322,6 +322,7 @@ struct ExportPayload: Encodable {
     let projection: [ExportProjection]
     let topCategories: [ExportBreakdown]
     let topCohorts: [ExportBreakdown]
+    let runway: ExportRunway?
 }
 
 struct ExportDateRange: Encodable {
@@ -370,6 +371,32 @@ struct ExportBreakdown: Encodable {
     let name: String
     let amount: Double
     let share: Double
+}
+
+struct Runway {
+    let year: Int
+    let periodsReported: Int
+    let periodsPerYear: Int
+    let remainingPeriods: Int
+    let yearToDate: Double
+    let remainingBudget: Double
+    let requiredAverage: Double?
+    let recentAverage: Double?
+    let recentPeriods: Int
+    let deltaVsRecent: Double?
+}
+
+struct ExportRunway: Encodable {
+    let year: Int
+    let periodsReported: Int
+    let periodsPerYear: Int
+    let remainingPeriods: Int
+    let yearToDate: Double
+    let remainingBudget: Double
+    let requiredAverage: Double?
+    let recentAverage: Double?
+    let recentPeriods: Int
+    let deltaVsRecent: Double?
 }
 
 func buildSummary(records: [Record], config: Config) -> Summary {
@@ -458,6 +485,50 @@ func buildProjection(entries: [PeriodEntry], totals: [String: Double], config: C
         projected[cursor] = average
     }
     return projected
+}
+
+func buildRunway(summary: Summary, config: Config) -> Runway? {
+    guard let latestYear = summary.yearTotals.keys.max(),
+          let yearTotal = summary.yearTotals[latestYear] else {
+        return nil
+    }
+
+    let periodsPerYear = summary.periodType == .month ? 12 : 4
+    let periodCount = summary.yearPeriods[latestYear]?.count ?? 0
+    let remainingPeriods = max(0, periodsPerYear - periodCount)
+    let remainingBudget = config.annualBudget - yearTotal
+    let requiredAverage = remainingPeriods > 0 ? remainingBudget / Double(remainingPeriods) : nil
+
+    let yearEntries = summary.periodEntries.filter { $0.year == latestYear }
+    let recentCount = min(3, yearEntries.count)
+    let recentAverage: Double?
+    if recentCount > 0 {
+        let recentEntries = yearEntries.suffix(recentCount)
+        let recentTotal = recentEntries.reduce(0.0) { $0 + (summary.periodTotals[$1.key] ?? 0) }
+        recentAverage = recentTotal / Double(recentCount)
+    } else {
+        recentAverage = nil
+    }
+
+    let deltaVsRecent: Double?
+    if let required = requiredAverage, let recent = recentAverage {
+        deltaVsRecent = required - recent
+    } else {
+        deltaVsRecent = nil
+    }
+
+    return Runway(
+        year: latestYear,
+        periodsReported: periodCount,
+        periodsPerYear: periodsPerYear,
+        remainingPeriods: remainingPeriods,
+        yearToDate: yearTotal,
+        remainingBudget: remainingBudget,
+        requiredAverage: requiredAverage,
+        recentAverage: recentAverage,
+        recentPeriods: recentCount,
+        deltaVsRecent: deltaVsRecent
+    )
 }
 
 func buildMissingPeriods(entries: [PeriodEntry], totals: [String: Double], period: PeriodType) -> [PeriodEntry] {
@@ -589,7 +660,21 @@ func exportReport(summary: Summary, config: Config, to path: String) throws {
         },
         projection: projections,
         topCategories: buildBreakdownEntries(totals: summary.categoryTotals, totalAmount: summary.totalAmount),
-        topCohorts: buildBreakdownEntries(totals: summary.cohortTotals, totalAmount: summary.totalAmount)
+        topCohorts: buildBreakdownEntries(totals: summary.cohortTotals, totalAmount: summary.totalAmount),
+        runway: buildRunway(summary: summary, config: config).map {
+            ExportRunway(
+                year: $0.year,
+                periodsReported: $0.periodsReported,
+                periodsPerYear: $0.periodsPerYear,
+                remainingPeriods: $0.remainingPeriods,
+                yearToDate: $0.yearToDate,
+                remainingBudget: $0.remainingBudget,
+                requiredAverage: $0.requiredAverage,
+                recentAverage: $0.recentAverage,
+                recentPeriods: $0.recentPeriods,
+                deltaVsRecent: $0.deltaVsRecent
+            )
+        }
     )
 
     let encoder = JSONEncoder()
@@ -727,6 +812,30 @@ func printReport(summary: Summary, config: Config) {
         print(String(format: "Projected year-end: $%.2f", projectedYearEnd))
         print(String(format: "Projected vs budget: $%.2f", varianceVsBudget))
         print(String(format: "Remaining budget: $%.2f", remainingBudget))
+    }
+
+    if let runway = buildRunway(summary: summary, config: config) {
+        print("")
+        print("Budget Runway")
+        print(String(format: "Remaining periods: %d of %d", runway.remainingPeriods, runway.periodsPerYear))
+        print(String(format: "Remaining budget: $%.2f", runway.remainingBudget))
+        if let requiredAverage = runway.requiredAverage {
+            print(String(format: "Required avg per remaining period: $%.2f", requiredAverage))
+        } else {
+            print("Required avg per remaining period: n/a")
+        }
+        if let recentAverage = runway.recentAverage, runway.recentPeriods > 0 {
+            print(String(format: "Recent avg (last %d periods): $%.2f", runway.recentPeriods, recentAverage))
+        }
+        if let delta = runway.deltaVsRecent {
+            if delta > 0 {
+                print(String(format: "Need to increase by $%.2f per period to hit budget.", delta))
+            } else if delta < 0 {
+                print(String(format: "Need to decrease by $%.2f per period to hit budget.", abs(delta)))
+            } else {
+                print("On track with recent pace.")
+            }
+        }
     }
 
     let topCategory = topBreakdown(title: "Top Categories", totals: summary.categoryTotals, totalAmount: summary.totalAmount)

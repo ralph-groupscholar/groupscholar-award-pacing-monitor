@@ -11,6 +11,7 @@ A Swift CLI for tracking scholarship award disbursement pacing against an annual
 - Missing period detection across the reporting window
 - Largest period-over-period swing highlights
 - Current-year snapshot with projected year-end burn vs budget
+- Budget runway guidance on remaining-period targets vs recent pace
 - Cumulative pacing view to see running variance
 - Top category and cohort spend mix
 - Optional date, category, and cohort filters to focus specific slices

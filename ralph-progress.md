@@ -19,3 +19,7 @@
 ## Iteration 4
 - Added cumulative pacing breakdowns to surface running variance against expected spend.
 - Added JSON export for downstream reporting and updated CLI usage/README.
+
+## Iteration 5
+- Added budget runway guidance comparing required remaining-period averages vs recent pace.
+- Included runway metrics in the JSON export and updated README feature list.
