@@ -1,4 +1,6 @@
 import Foundation
+import NIOPosix
+import PostgresNIO
 
 struct Config {
     let filePath: String
@@ -10,6 +12,8 @@ struct Config {
     let categoryFilters: [String]
     let cohortFilters: [String]
     let exportPath: String?
+    let dbSync: Bool
+    let dbSchema: String?
 }
 
 enum PeriodType: String {
@@ -54,6 +58,11 @@ struct groupscholar_award_pacing_monitor {
                 print("")
                 print("Exported JSON report to \(exportPath)")
             }
+            if config.dbSync {
+                try syncToDatabase(summary: summary, config: config)
+                print("")
+                print("Synced report snapshot to database.")
+            }
         } catch {
             fputs("Error: \(error)\n", stderr)
             printUsage()
@@ -72,6 +81,8 @@ func parseArgs(_ args: [String]) throws -> Config {
     var categoryFilters: [String] = []
     var cohortFilters: [String] = []
     var exportPath: String?
+    var dbSync = false
+    var dbSchema: String?
 
     var index = 0
     while index < args.count {
@@ -120,6 +131,12 @@ func parseArgs(_ args: [String]) throws -> Config {
             index += 1
             guard index < args.count else { throw ArgError.missingValue("--export-json") }
             exportPath = args[index]
+        case "--db-sync":
+            dbSync = true
+        case "--db-schema":
+            index += 1
+            guard index < args.count else { throw ArgError.missingValue("--db-schema") }
+            dbSchema = args[index]
         case "--help", "-h":
             printUsage()
             exit(0)
@@ -141,7 +158,9 @@ func parseArgs(_ args: [String]) throws -> Config {
         endDate: endDate,
         categoryFilters: categoryFilters,
         cohortFilters: cohortFilters,
-        exportPath: exportPath
+        exportPath: exportPath,
+        dbSync: dbSync,
+        dbSchema: dbSchema
     )
 }
 
@@ -165,6 +184,20 @@ enum ArgError: Error, CustomStringConvertible {
     }
 }
 
+enum DbError: Error, CustomStringConvertible {
+    case missingEnv(String)
+    case invalidEnv(String)
+
+    var description: String {
+        switch self {
+        case .missingEnv(let name):
+            return "Missing required environment variable \(name)"
+        case .invalidEnv(let name):
+            return "Invalid environment variable value for \(name)"
+        }
+    }
+}
+
 func printUsage() {
     let usage = """
     Group Scholar Award Pacing Monitor
@@ -172,9 +205,14 @@ func printUsage() {
     Usage:
       groupscholar-award-pacing-monitor --file <csv> --budget <annual_budget> [--period month|quarter] [--projection-periods N]
                    [--start-date YYYY-MM-DD] [--end-date YYYY-MM-DD] [--category list] [--cohort list] [--export-json path]
+                   [--db-sync] [--db-schema name]
 
     Example:
       swift run groupscholar-award-pacing-monitor --file sample/awards.csv --budget 240000 --period month --projection-periods 4 --start-date 2025-01-01 --category Tuition,Stipend --export-json out/report.json
+
+    Database sync env vars (required when --db-sync is set):
+      GS_DB_HOST, GS_DB_PORT, GS_DB_USER, GS_DB_PASSWORD, GS_DB_NAME
+      GS_DB_SCHEMA (optional, defaults to award_pacing_monitor or --db-schema)
     """
     print(usage)
 }
@@ -271,7 +309,10 @@ func applyFilters(records: [Record], config: Config) -> [Record] {
 struct Summary {
     let totalRecords: Int
     let totalAmount: Double
+    let averageAward: Double
+    let medianAward: Double
     let periodTotals: [String: Double]
+    let periodCounts: [String: Int]
     let periodEntries: [PeriodEntry]
     let missingPeriods: [PeriodEntry]
     let expectedPerPeriod: Double
@@ -342,6 +383,8 @@ struct ExportTotals: Encodable {
     let actual: Double
     let expected: Double
     let variance: Double
+    let averageAward: Double
+    let medianAward: Double
 }
 
 struct ExportPeriod: Encodable {
@@ -349,6 +392,8 @@ struct ExportPeriod: Encodable {
     let actual: Double
     let expected: Double
     let pace: Double
+    let recordCount: Int
+    let averageAward: Double
     let cumulativeActual: Double
     let cumulativeExpected: Double
     let cumulativeVariance: Double
@@ -402,6 +447,7 @@ struct ExportRunway: Encodable {
 func buildSummary(records: [Record], config: Config) -> Summary {
     let calendar = Calendar(identifier: .gregorian)
     var periodTotals: [String: Double] = [:]
+    var periodCounts: [String: Int] = [:]
     var entries: [String: PeriodEntry] = [:]
     var categoryTotals: [String: Double] = [:]
     var cohortTotals: [String: Double] = [:]
@@ -409,6 +455,7 @@ func buildSummary(records: [Record], config: Config) -> Summary {
     var yearPeriods: [Int: Set<String>] = [:]
     var minDate = Date.distantFuture
     var maxDate = Date.distantPast
+    var amounts: [Double] = []
 
     for record in records {
         guard let date = calendar.date(from: DateComponents(year: record.year, month: record.month, day: record.day)) else { continue }
@@ -417,6 +464,7 @@ func buildSummary(records: [Record], config: Config) -> Summary {
 
         let keyInfo = periodKey(for: record, period: config.period, calendar: calendar)
         periodTotals[keyInfo.key, default: 0] += record.amount
+        periodCounts[keyInfo.key, default: 0] += 1
         entries[keyInfo.key] = keyInfo
         categoryTotals[record.category, default: 0] += record.amount
         cohortTotals[record.cohort, default: 0] += record.amount
@@ -424,6 +472,7 @@ func buildSummary(records: [Record], config: Config) -> Summary {
         var yearSet = yearPeriods[keyInfo.year, default: Set<String>()]
         yearSet.insert(keyInfo.key)
         yearPeriods[keyInfo.year] = yearSet
+        amounts.append(record.amount)
     }
 
     let expectedPerPeriod: Double = config.period == .month ? config.annualBudget / 12.0 : config.annualBudget / 4.0
@@ -433,11 +482,17 @@ func buildSummary(records: [Record], config: Config) -> Summary {
     let periodDeltas = buildPeriodDeltas(entries: orderedEntries, totals: periodTotals)
     let projection = buildProjection(entries: orderedEntries, totals: periodTotals, config: config)
     let paceFlags = buildPaceFlags(entries: orderedEntries, totals: periodTotals, expectedPerPeriod: expectedPerPeriod)
+    let totalAmount = periodTotals.values.reduce(0, +)
+    let averageAward = records.isEmpty ? 0 : totalAmount / Double(records.count)
+    let medianAward = computeMedian(values: amounts)
 
     return Summary(
         totalRecords: records.count,
-        totalAmount: periodTotals.values.reduce(0, +),
+        totalAmount: totalAmount,
+        averageAward: averageAward,
+        medianAward: medianAward,
         periodTotals: periodTotals,
+        periodCounts: periodCounts,
         periodEntries: orderedEntries,
         missingPeriods: missingPeriods,
         expectedPerPeriod: expectedPerPeriod,
@@ -574,6 +629,16 @@ func buildCumulative(entries: [PeriodEntry], totals: [String: Double], expectedP
     return results
 }
 
+func computeMedian(values: [Double]) -> Double {
+    guard !values.isEmpty else { return 0 }
+    let sorted = values.sorted()
+    let mid = sorted.count / 2
+    if sorted.count % 2 == 0 {
+        return (sorted[mid - 1] + sorted[mid]) / 2
+    }
+    return sorted[mid]
+}
+
 func nextPeriod(from entry: PeriodEntry, period: PeriodType) -> PeriodEntry {
     let calendar = Calendar(identifier: .gregorian)
     let monthIncrement = period == .month ? 1 : 3
@@ -616,12 +681,16 @@ func exportReport(summary: Summary, config: Config, to path: String) throws {
     let periods: [ExportPeriod] = summary.periodEntries.enumerated().map { index, entry in
         let actual = summary.periodTotals[entry.key] ?? 0
         let pace = summary.expectedPerPeriod > 0 ? actual / summary.expectedPerPeriod : 0
+        let recordCount = summary.periodCounts[entry.key] ?? 0
+        let averageAward = recordCount > 0 ? actual / Double(recordCount) : 0
         let cumulativeEntry = cumulative[index]
         return ExportPeriod(
             key: entry.key,
             actual: actual,
             expected: summary.expectedPerPeriod,
             pace: pace,
+            recordCount: recordCount,
+            averageAward: averageAward,
             cumulativeActual: cumulativeEntry.actual,
             cumulativeExpected: cumulativeEntry.expected,
             cumulativeVariance: cumulativeEntry.variance
@@ -651,7 +720,9 @@ func exportReport(summary: Summary, config: Config, to path: String) throws {
             records: summary.totalRecords,
             actual: summary.totalAmount,
             expected: expectedTotal,
-            variance: variance
+            variance: variance,
+            averageAward: summary.averageAward,
+            medianAward: summary.medianAward
         ),
         periods: periods,
         missingPeriods: summary.missingPeriods.map { $0.key },
@@ -698,6 +769,8 @@ func printReport(summary: Summary, config: Config) {
     print(String(format: "Total spent: $%.2f", summary.totalAmount))
     print(String(format: "Expected (%.0f periods): $%.2f", Double(totalPeriods), expectedTotal))
     print(String(format: "Variance: $%.2f", variance))
+    print(String(format: "Average award: $%.2f", summary.averageAward))
+    print(String(format: "Median award: $%.2f", summary.medianAward))
 
     if config.startDate != nil || config.endDate != nil || !config.categoryFilters.isEmpty || !config.cohortFilters.isEmpty {
         print("")
@@ -718,14 +791,16 @@ func printReport(summary: Summary, config: Config) {
     print("")
 
     print("Period Breakdown")
-    let header = String(format: "%-10@ | %-12@ | %-12@ | %-8@", "Period" as NSString, "Actual" as NSString, "Expected" as NSString, "Pace" as NSString)
+    let header = String(format: "%-10@ | %-6@ | %-12@ | %-12@ | %-8@ | %-12@", "Period" as NSString, "Count" as NSString, "Actual" as NSString, "Expected" as NSString, "Pace" as NSString, "Avg Award" as NSString)
     print(header)
-    print(String(repeating: "-", count: 52))
+    print(String(repeating: "-", count: 78))
 
     for entry in summary.periodEntries {
         let actual = summary.periodTotals[entry.key] ?? 0
         let pace = summary.expectedPerPeriod > 0 ? actual / summary.expectedPerPeriod : 0
-        let row = String(format: "%-10@ | $%-11.2f | $%-11.2f | %-7.0f%%", entry.key as NSString, actual, summary.expectedPerPeriod, pace * 100)
+        let count = summary.periodCounts[entry.key] ?? 0
+        let averageAward = count > 0 ? actual / Double(count) : 0
+        let row = String(format: "%-10@ | %-6d | $%-11.2f | $%-11.2f | %-7.0f%% | $%-11.2f", entry.key as NSString, count, actual, summary.expectedPerPeriod, pace * 100, averageAward)
         print(row)
     }
 
@@ -868,5 +943,247 @@ func buildBreakdownEntries(totals: [String: Double], totalAmount: Double) -> [Ex
     return sorted.prefix(5).map { entry in
         let share = (entry.value / totalAmount) * 100
         return ExportBreakdown(name: entry.key, amount: entry.value, share: share)
+    }
+}
+
+struct DBConfig {
+    let host: String
+    let port: Int
+    let username: String
+    let password: String
+    let database: String
+    let schema: String
+}
+
+func loadDbConfig(config: Config) throws -> DBConfig {
+    let env = ProcessInfo.processInfo.environment
+    guard let host = env["GS_DB_HOST"], !host.isEmpty else { throw DbError.missingEnv("GS_DB_HOST") }
+    guard let portRaw = env["GS_DB_PORT"], let port = Int(portRaw) else { throw DbError.invalidEnv("GS_DB_PORT") }
+    guard let user = env["GS_DB_USER"], !user.isEmpty else { throw DbError.missingEnv("GS_DB_USER") }
+    guard let password = env["GS_DB_PASSWORD"], !password.isEmpty else { throw DbError.missingEnv("GS_DB_PASSWORD") }
+    guard let database = env["GS_DB_NAME"], !database.isEmpty else { throw DbError.missingEnv("GS_DB_NAME") }
+    let schema = config.dbSchema ?? env["GS_DB_SCHEMA"] ?? "award_pacing_monitor"
+
+    return DBConfig(host: host, port: port, username: user, password: password, database: database, schema: schema)
+}
+
+func sqlLiteral(_ value: String) -> String {
+    value.replacingOccurrences(of: "'", with: "''")
+}
+
+func sqlDecimal(_ value: Double) -> String {
+    guard value.isFinite else { return "0" }
+    return String(format: "%.2f", value)
+}
+
+func sqlDate(_ date: Date) -> String {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd"
+    formatter.timeZone = TimeZone(secondsFromGMT: 0)
+    return formatter.string(from: date)
+}
+
+func sqlTimestamp(_ date: Date) -> String {
+    let formatter = ISO8601DateFormatter()
+    formatter.timeZone = TimeZone(secondsFromGMT: 0)
+    return formatter.string(from: date)
+}
+
+func encodeFiltersJson(config: Config) throws -> String {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd"
+    formatter.timeZone = TimeZone(secondsFromGMT: 0)
+    let filters = ExportFilters(
+        startDate: config.startDate.map { formatter.string(from: $0) },
+        endDate: config.endDate.map { formatter.string(from: $0) },
+        categories: config.categoryFilters,
+        cohorts: config.cohortFilters
+    )
+    let encoder = JSONEncoder()
+    let data = try encoder.encode(filters)
+    return String(data: data, encoding: .utf8) ?? "{}"
+}
+
+func syncToDatabase(summary: Summary, config: Config) throws {
+    let dbConfig = try loadDbConfig(config: config)
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    defer { try? group.syncShutdownGracefully() }
+
+    let pgConfig = PostgresConfiguration(
+        host: dbConfig.host,
+        port: dbConfig.port,
+        username: dbConfig.username,
+        password: dbConfig.password,
+        database: dbConfig.database,
+        tls: .disable
+    )
+    let connection = try PostgresConnection.connect(on: group.next(), configuration: pgConfig).wait()
+    defer { try? connection.close().wait() }
+
+    let schema = dbConfig.schema
+    try connection.simpleQuery("CREATE SCHEMA IF NOT EXISTS \(schema);").wait()
+
+    let createSnapshots = """
+    CREATE TABLE IF NOT EXISTS \(schema).snapshots (
+        snapshot_id UUID PRIMARY KEY,
+        generated_at TIMESTAMPTZ NOT NULL,
+        period_type TEXT NOT NULL,
+        annual_budget NUMERIC NOT NULL,
+        start_date DATE NOT NULL,
+        end_date DATE NOT NULL,
+        total_records INTEGER NOT NULL,
+        total_amount NUMERIC NOT NULL,
+        expected_total NUMERIC NOT NULL,
+        variance NUMERIC NOT NULL,
+        average_award NUMERIC NOT NULL,
+        median_award NUMERIC NOT NULL,
+        filters_json TEXT NOT NULL
+    );
+    """
+    let createPeriods = """
+    CREATE TABLE IF NOT EXISTS \(schema).periods (
+        snapshot_id UUID NOT NULL,
+        period_key TEXT NOT NULL,
+        actual NUMERIC NOT NULL,
+        expected NUMERIC NOT NULL,
+        pace NUMERIC NOT NULL,
+        record_count INTEGER NOT NULL,
+        average_award NUMERIC NOT NULL,
+        cumulative_actual NUMERIC NOT NULL,
+        cumulative_expected NUMERIC NOT NULL,
+        cumulative_variance NUMERIC NOT NULL
+    );
+    """
+    let createPaceAlerts = """
+    CREATE TABLE IF NOT EXISTS \(schema).pace_alerts (
+        snapshot_id UUID NOT NULL,
+        period_key TEXT NOT NULL,
+        actual NUMERIC NOT NULL,
+        expected NUMERIC NOT NULL,
+        variance NUMERIC NOT NULL,
+        pace NUMERIC NOT NULL
+    );
+    """
+    let createProjections = """
+    CREATE TABLE IF NOT EXISTS \(schema).projections (
+        snapshot_id UUID NOT NULL,
+        period_key TEXT NOT NULL,
+        amount NUMERIC NOT NULL
+    );
+    """
+    let createBreakdowns = """
+    CREATE TABLE IF NOT EXISTS \(schema).breakdowns (
+        snapshot_id UUID NOT NULL,
+        breakdown_type TEXT NOT NULL,
+        name TEXT NOT NULL,
+        amount NUMERIC NOT NULL,
+        share NUMERIC NOT NULL
+    );
+    """
+    let createMissing = """
+    CREATE TABLE IF NOT EXISTS \(schema).missing_periods (
+        snapshot_id UUID NOT NULL,
+        period_key TEXT NOT NULL
+    );
+    """
+
+    try connection.simpleQuery(createSnapshots).wait()
+    try connection.simpleQuery(createPeriods).wait()
+    try connection.simpleQuery(createPaceAlerts).wait()
+    try connection.simpleQuery(createProjections).wait()
+    try connection.simpleQuery(createBreakdowns).wait()
+    try connection.simpleQuery(createMissing).wait()
+
+    try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS average_award NUMERIC NOT NULL DEFAULT 0;").wait()
+    try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS median_award NUMERIC NOT NULL DEFAULT 0;").wait()
+    try connection.simpleQuery("ALTER TABLE \(schema).periods ADD COLUMN IF NOT EXISTS record_count INTEGER NOT NULL DEFAULT 0;").wait()
+    try connection.simpleQuery("ALTER TABLE \(schema).periods ADD COLUMN IF NOT EXISTS average_award NUMERIC NOT NULL DEFAULT 0;").wait()
+
+    let snapshotId = UUID().uuidString
+    let generatedAt = Date()
+    let totalPeriods = summary.periodEntries.count
+    let expectedTotal = summary.expectedPerPeriod * Double(totalPeriods)
+    let variance = summary.totalAmount - expectedTotal
+    let filtersJson = try encodeFiltersJson(config: config)
+
+    let snapshotInsert = """
+    INSERT INTO \(schema).snapshots
+        (snapshot_id, generated_at, period_type, annual_budget, start_date, end_date, total_records, total_amount, expected_total, variance, average_award, median_award, filters_json)
+    VALUES
+        ('\(snapshotId)'::uuid, '\(sqlTimestamp(generatedAt))', '\(sqlLiteral(summary.periodType.rawValue))', \(sqlDecimal(config.annualBudget)),
+         '\(sqlDate(summary.startDate))', '\(sqlDate(summary.endDate))', \(summary.totalRecords), \(sqlDecimal(summary.totalAmount)),
+         \(sqlDecimal(expectedTotal)), \(sqlDecimal(variance)), \(sqlDecimal(summary.averageAward)), \(sqlDecimal(summary.medianAward)), '\(sqlLiteral(filtersJson))');
+    """
+
+    do {
+        try connection.simpleQuery("BEGIN;").wait()
+        try connection.simpleQuery(snapshotInsert).wait()
+
+        let cumulative = buildCumulative(entries: summary.periodEntries, totals: summary.periodTotals, expectedPerPeriod: summary.expectedPerPeriod)
+        for (index, entry) in summary.periodEntries.enumerated() {
+            let actual = summary.periodTotals[entry.key] ?? 0
+            let expected = summary.expectedPerPeriod
+            let pace = expected > 0 ? actual / expected : 0
+            let recordCount = summary.periodCounts[entry.key] ?? 0
+            let averageAward = recordCount > 0 ? actual / Double(recordCount) : 0
+            let cumulativeEntry = cumulative[index]
+            let insert = """
+            INSERT INTO \(schema).periods
+                (snapshot_id, period_key, actual, expected, pace, record_count, average_award, cumulative_actual, cumulative_expected, cumulative_variance)
+            VALUES
+                ('\(snapshotId)'::uuid, '\(sqlLiteral(entry.key))', \(sqlDecimal(actual)), \(sqlDecimal(expected)),
+                 \(sqlDecimal(pace)), \(recordCount), \(sqlDecimal(averageAward)), \(sqlDecimal(cumulativeEntry.actual)), \(sqlDecimal(cumulativeEntry.expected)), \(sqlDecimal(cumulativeEntry.variance)));
+            """
+            try connection.simpleQuery(insert).wait()
+        }
+
+        for missing in summary.missingPeriods {
+            let insert = """
+            INSERT INTO \(schema).missing_periods (snapshot_id, period_key)
+            VALUES ('\(snapshotId)'::uuid, '\(sqlLiteral(missing.key))');
+            """
+            try connection.simpleQuery(insert).wait()
+        }
+
+        for alert in summary.paceFlags {
+            let insert = """
+            INSERT INTO \(schema).pace_alerts (snapshot_id, period_key, actual, expected, variance, pace)
+            VALUES ('\(snapshotId)'::uuid, '\(sqlLiteral(alert.period))', \(sqlDecimal(alert.actual)), \(sqlDecimal(alert.expected)),
+                    \(sqlDecimal(alert.variance)), \(sqlDecimal(alert.pace)));
+            """
+            try connection.simpleQuery(insert).wait()
+        }
+
+        for entry in summary.projection.keys.sorted(by: { $0.date < $1.date }) {
+            if let amount = summary.projection[entry] {
+                let insert = """
+                INSERT INTO \(schema).projections (snapshot_id, period_key, amount)
+                VALUES ('\(snapshotId)'::uuid, '\(sqlLiteral(entry.key))', \(sqlDecimal(amount)));
+                """
+                try connection.simpleQuery(insert).wait()
+            }
+        }
+
+        let categoryBreakdowns = buildBreakdownEntries(totals: summary.categoryTotals, totalAmount: summary.totalAmount)
+        let cohortBreakdowns = buildBreakdownEntries(totals: summary.cohortTotals, totalAmount: summary.totalAmount)
+        for entry in categoryBreakdowns {
+            let insert = """
+            INSERT INTO \(schema).breakdowns (snapshot_id, breakdown_type, name, amount, share)
+            VALUES ('\(snapshotId)'::uuid, 'category', '\(sqlLiteral(entry.name))', \(sqlDecimal(entry.amount)), \(sqlDecimal(entry.share)));
+            """
+            try connection.simpleQuery(insert).wait()
+        }
+        for entry in cohortBreakdowns {
+            let insert = """
+            INSERT INTO \(schema).breakdowns (snapshot_id, breakdown_type, name, amount, share)
+            VALUES ('\(snapshotId)'::uuid, 'cohort', '\(sqlLiteral(entry.name))', \(sqlDecimal(entry.amount)), \(sqlDecimal(entry.share)));
+            """
+            try connection.simpleQuery(insert).wait()
+        }
+
+        try connection.simpleQuery("COMMIT;").wait()
+    } catch {
+        try? connection.simpleQuery("ROLLBACK;").wait()
+        throw error
     }
 }

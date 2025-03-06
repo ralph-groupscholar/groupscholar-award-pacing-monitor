@@ -23,3 +23,7 @@
 ## Iteration 5
 - Added budget runway guidance comparing required remaining-period averages vs recent pace.
 - Included runway metrics in the JSON export and updated README feature list.
+
+## Iteration 6
+- Added award size statistics (average and median) plus per-period award counts/averages in the CLI and JSON export.
+- Extended database sync schema and inserts to persist award size and count metrics.

@@ -5,11 +5,22 @@ import PackageDescription
 
 let package = Package(
     name: "groupscholar-award-pacing-monitor",
+    platforms: [
+        .macOS(.v10_15)
+    ],
+    dependencies: [
+        .package(url: "https://github.com/vapor/postgres-nio.git", from: "1.21.0"),
+        .package(url: "https://github.com/apple/swift-nio.git", from: "2.67.0"),
+    ],
     targets: [
         // Targets are the basic building blocks of a package, defining a module or a test suite.
         // Targets can depend on other targets in this package and products from dependencies.
         .executableTarget(
-            name: "groupscholar-award-pacing-monitor"
+            name: "groupscholar-award-pacing-monitor",
+            dependencies: [
+                .product(name: "PostgresNIO", package: "postgres-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+            ]
         ),
     ]
 )
