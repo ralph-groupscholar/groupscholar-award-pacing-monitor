@@ -15,6 +15,7 @@ A Swift CLI for tracking scholarship award disbursement pacing against an annual
 - Cumulative pacing view to see running variance
 - Period award counts plus average/median award size
 - Top category and cohort spend mix
+- Optional category/cohort target mix variance tracking
 - Optional date, category, and cohort filters to focus specific slices
 - Optional JSON export for downstream reporting
 - Optional database snapshot sync for reporting dashboards
@@ -31,6 +32,10 @@ swift run groupscholar-award-pacing-monitor --file sample/awards.csv --budget 24
 
 ```sh
 swift run groupscholar-award-pacing-monitor --file sample/awards.csv --budget 240000 --period month --projection-periods 4 --export-json out/report.json
+```
+
+```sh
+swift run groupscholar-award-pacing-monitor --file sample/awards.csv --budget 240000 --period month --category-targets Tuition=70,Stipend=20,Travel=10 --cohort-targets "Fall 2025"=60,"Spring 2026"=40
 ```
 
 ```sh

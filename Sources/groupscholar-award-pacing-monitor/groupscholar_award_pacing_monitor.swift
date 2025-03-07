@@ -11,6 +11,8 @@ struct Config {
     let endDate: Date?
     let categoryFilters: [String]
     let cohortFilters: [String]
+    let categoryTargets: [TargetConfig]
+    let cohortTargets: [TargetConfig]
     let exportPath: String?
     let dbSync: Bool
     let dbSchema: String?
@@ -34,6 +36,12 @@ struct PeriodEntry: Hashable {
     let key: String
     let date: Date
     let year: Int
+}
+
+struct TargetConfig {
+    let name: String
+    let share: Double
+    let normalized: String
 }
 
 @main
@@ -80,6 +88,8 @@ func parseArgs(_ args: [String]) throws -> Config {
     var endDate: Date?
     var categoryFilters: [String] = []
     var cohortFilters: [String] = []
+    var categoryTargets: [TargetConfig] = []
+    var cohortTargets: [TargetConfig] = []
     var exportPath: String?
     var dbSync = false
     var dbSchema: String?
@@ -127,6 +137,14 @@ func parseArgs(_ args: [String]) throws -> Config {
             index += 1
             guard index < args.count else { throw ArgError.missingValue("--cohort") }
             cohortFilters = parseFilterList(args[index])
+        case "--category-targets":
+            index += 1
+            guard index < args.count else { throw ArgError.missingValue("--category-targets") }
+            categoryTargets = try parseTargetList(args[index], flag: "--category-targets")
+        case "--cohort-targets":
+            index += 1
+            guard index < args.count else { throw ArgError.missingValue("--cohort-targets") }
+            cohortTargets = try parseTargetList(args[index], flag: "--cohort-targets")
         case "--export-json":
             index += 1
             guard index < args.count else { throw ArgError.missingValue("--export-json") }
@@ -158,6 +176,8 @@ func parseArgs(_ args: [String]) throws -> Config {
         endDate: endDate,
         categoryFilters: categoryFilters,
         cohortFilters: cohortFilters,
+        categoryTargets: categoryTargets,
+        cohortTargets: cohortTargets,
         exportPath: exportPath,
         dbSync: dbSync,
         dbSchema: dbSchema
@@ -204,8 +224,8 @@ func printUsage() {
 
     Usage:
       groupscholar-award-pacing-monitor --file <csv> --budget <annual_budget> [--period month|quarter] [--projection-periods N]
-                   [--start-date YYYY-MM-DD] [--end-date YYYY-MM-DD] [--category list] [--cohort list] [--export-json path]
-                   [--db-sync] [--db-schema name]
+                   [--start-date YYYY-MM-DD] [--end-date YYYY-MM-DD] [--category list] [--cohort list]
+                   [--category-targets list] [--cohort-targets list] [--export-json path] [--db-sync] [--db-schema name]
 
     Example:
       swift run groupscholar-award-pacing-monitor --file sample/awards.csv --budget 240000 --period month --projection-periods 4 --start-date 2025-01-01 --category Tuition,Stipend --export-json out/report.json
@@ -280,6 +300,30 @@ func parseFilterList(_ raw: String) -> [String] {
     raw.split(separator: ",")
         .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
         .filter { !$0.isEmpty }
+}
+
+func parseTargetList(_ raw: String, flag: String) throws -> [TargetConfig] {
+    let entries = raw.split(separator: ",").map { String($0) }
+    var results: [TargetConfig] = []
+    var totalShare = 0.0
+
+    for entry in entries {
+        let parts = entry.split(separator: "=", maxSplits: 1).map { String($0) }
+        guard parts.count == 2 else { throw ArgError.invalidValue(flag) }
+        let name = parts[0].trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawValue = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, let parsed = Double(rawValue) else { throw ArgError.invalidValue(flag) }
+        let share = parsed > 1.0 ? parsed / 100.0 : parsed
+        guard share >= 0 else { throw ArgError.invalidValue(flag) }
+        totalShare += share
+        results.append(TargetConfig(name: name, share: share, normalized: name.lowercased()))
+    }
+
+    if totalShare > 1.001 {
+        throw ArgError.invalidValue(flag)
+    }
+
+    return results
 }
 
 func recordDate(_ record: Record) -> Date? {
@@ -363,6 +407,8 @@ struct ExportPayload: Encodable {
     let projection: [ExportProjection]
     let topCategories: [ExportBreakdown]
     let topCohorts: [ExportBreakdown]
+    let categoryTargets: [ExportTargetVariance]?
+    let cohortTargets: [ExportTargetVariance]?
     let runway: ExportRunway?
 }
 
@@ -418,6 +464,15 @@ struct ExportBreakdown: Encodable {
     let share: Double
 }
 
+struct ExportTargetVariance: Encodable {
+    let name: String
+    let targetShare: Double
+    let actualAmount: Double
+    let expectedAmount: Double
+    let variance: Double
+    let actualShare: Double
+}
+
 struct Runway {
     let year: Int
     let periodsReported: Int
@@ -442,6 +497,15 @@ struct ExportRunway: Encodable {
     let recentAverage: Double?
     let recentPeriods: Int
     let deltaVsRecent: Double?
+}
+
+struct TargetVariance {
+    let name: String
+    let targetShare: Double
+    let actualAmount: Double
+    let expectedAmount: Double
+    let variance: Double
+    let actualShare: Double
 }
 
 func buildSummary(records: [Record], config: Config) -> Summary {
@@ -702,6 +766,9 @@ func exportReport(summary: Summary, config: Config, to path: String) throws {
         return ExportProjection(period: entry.key, amount: amount)
     }
 
+    let categoryTargetVariances = buildTargetVariances(targets: config.categoryTargets, totals: summary.categoryTotals, totalAmount: summary.totalAmount)
+    let cohortTargetVariances = buildTargetVariances(targets: config.cohortTargets, totals: summary.cohortTotals, totalAmount: summary.totalAmount)
+
     let payload = ExportPayload(
         generatedAt: formatter.string(from: Date()),
         periodType: summary.periodType.rawValue,
@@ -732,6 +799,26 @@ func exportReport(summary: Summary, config: Config, to path: String) throws {
         projection: projections,
         topCategories: buildBreakdownEntries(totals: summary.categoryTotals, totalAmount: summary.totalAmount),
         topCohorts: buildBreakdownEntries(totals: summary.cohortTotals, totalAmount: summary.totalAmount),
+        categoryTargets: categoryTargetVariances.isEmpty ? nil : categoryTargetVariances.map {
+            ExportTargetVariance(
+                name: $0.name,
+                targetShare: $0.targetShare,
+                actualAmount: $0.actualAmount,
+                expectedAmount: $0.expectedAmount,
+                variance: $0.variance,
+                actualShare: $0.actualShare
+            )
+        },
+        cohortTargets: cohortTargetVariances.isEmpty ? nil : cohortTargetVariances.map {
+            ExportTargetVariance(
+                name: $0.name,
+                targetShare: $0.targetShare,
+                actualAmount: $0.actualAmount,
+                expectedAmount: $0.expectedAmount,
+                variance: $0.variance,
+                actualShare: $0.actualShare
+            )
+        },
         runway: buildRunway(summary: summary, config: config).map {
             ExportRunway(
                 year: $0.year,
@@ -924,6 +1011,42 @@ func printReport(summary: Summary, config: Config) {
         print("")
         print(topCohort)
     }
+
+    let categoryTargets = buildTargetVariances(targets: config.categoryTargets, totals: summary.categoryTotals, totalAmount: summary.totalAmount)
+    if !categoryTargets.isEmpty {
+        print("")
+        print("Category Targets")
+        for target in categoryTargets {
+            let varianceLabel = String(format: "%+.2f", target.variance)
+            let row = String(
+                format: "%-20@ | Target %.1f%% | Actual $%.2f (%.1f%%) | Variance $%@",
+                target.name as NSString,
+                target.targetShare * 100,
+                target.actualAmount,
+                target.actualShare * 100,
+                varianceLabel
+            )
+            print(row)
+        }
+    }
+
+    let cohortTargets = buildTargetVariances(targets: config.cohortTargets, totals: summary.cohortTotals, totalAmount: summary.totalAmount)
+    if !cohortTargets.isEmpty {
+        print("")
+        print("Cohort Targets")
+        for target in cohortTargets {
+            let varianceLabel = String(format: "%+.2f", target.variance)
+            let row = String(
+                format: "%-20@ | Target %.1f%% | Actual $%.2f (%.1f%%) | Variance $%@",
+                target.name as NSString,
+                target.targetShare * 100,
+                target.actualAmount,
+                target.actualShare * 100,
+                varianceLabel
+            )
+            print(row)
+        }
+    }
 }
 
 func topBreakdown(title: String, totals: [String: Double], totalAmount: Double) -> String {
@@ -943,6 +1066,30 @@ func buildBreakdownEntries(totals: [String: Double], totalAmount: Double) -> [Ex
     return sorted.prefix(5).map { entry in
         let share = (entry.value / totalAmount) * 100
         return ExportBreakdown(name: entry.key, amount: entry.value, share: share)
+    }
+}
+
+func buildTargetVariances(targets: [TargetConfig], totals: [String: Double], totalAmount: Double) -> [TargetVariance] {
+    guard totalAmount > 0, !targets.isEmpty else { return [] }
+    var normalizedTotals: [String: Double] = [:]
+    for (key, value) in totals {
+        let normalized = key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        normalizedTotals[normalized, default: 0] += value
+    }
+
+    return targets.map { target in
+        let actual = normalizedTotals[target.normalized] ?? 0
+        let expected = totalAmount * target.share
+        let variance = actual - expected
+        let actualShare = actual / totalAmount
+        return TargetVariance(
+            name: target.name,
+            targetShare: target.share,
+            actualAmount: actual,
+            expectedAmount: expected,
+            variance: variance,
+            actualShare: actualShare
+        )
     }
 }
 
@@ -1080,6 +1227,18 @@ func syncToDatabase(summary: Summary, config: Config) throws {
         share NUMERIC NOT NULL
     );
     """
+    let createTargets = """
+    CREATE TABLE IF NOT EXISTS \(schema).targets (
+        snapshot_id UUID NOT NULL,
+        target_type TEXT NOT NULL,
+        name TEXT NOT NULL,
+        target_share NUMERIC NOT NULL,
+        actual_amount NUMERIC NOT NULL,
+        expected_amount NUMERIC NOT NULL,
+        variance NUMERIC NOT NULL,
+        actual_share NUMERIC NOT NULL
+    );
+    """
     let createMissing = """
     CREATE TABLE IF NOT EXISTS \(schema).missing_periods (
         snapshot_id UUID NOT NULL,
@@ -1092,6 +1251,7 @@ func syncToDatabase(summary: Summary, config: Config) throws {
     try connection.simpleQuery(createPaceAlerts).wait()
     try connection.simpleQuery(createProjections).wait()
     try connection.simpleQuery(createBreakdowns).wait()
+    try connection.simpleQuery(createTargets).wait()
     try connection.simpleQuery(createMissing).wait()
 
     try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS average_award NUMERIC NOT NULL DEFAULT 0;").wait()
@@ -1177,6 +1337,25 @@ func syncToDatabase(summary: Summary, config: Config) throws {
             let insert = """
             INSERT INTO \(schema).breakdowns (snapshot_id, breakdown_type, name, amount, share)
             VALUES ('\(snapshotId)'::uuid, 'cohort', '\(sqlLiteral(entry.name))', \(sqlDecimal(entry.amount)), \(sqlDecimal(entry.share)));
+            """
+            try connection.simpleQuery(insert).wait()
+        }
+
+        let categoryTargets = buildTargetVariances(targets: config.categoryTargets, totals: summary.categoryTotals, totalAmount: summary.totalAmount)
+        let cohortTargets = buildTargetVariances(targets: config.cohortTargets, totals: summary.cohortTotals, totalAmount: summary.totalAmount)
+        for entry in categoryTargets {
+            let insert = """
+            INSERT INTO \(schema).targets (snapshot_id, target_type, name, target_share, actual_amount, expected_amount, variance, actual_share)
+            VALUES ('\(snapshotId)'::uuid, 'category', '\(sqlLiteral(entry.name))', \(sqlDecimal(entry.targetShare)),
+                    \(sqlDecimal(entry.actualAmount)), \(sqlDecimal(entry.expectedAmount)), \(sqlDecimal(entry.variance)), \(sqlDecimal(entry.actualShare)));
+            """
+            try connection.simpleQuery(insert).wait()
+        }
+        for entry in cohortTargets {
+            let insert = """
+            INSERT INTO \(schema).targets (snapshot_id, target_type, name, target_share, actual_amount, expected_amount, variance, actual_share)
+            VALUES ('\(snapshotId)'::uuid, 'cohort', '\(sqlLiteral(entry.name))', \(sqlDecimal(entry.targetShare)),
+                    \(sqlDecimal(entry.actualAmount)), \(sqlDecimal(entry.expectedAmount)), \(sqlDecimal(entry.variance)), \(sqlDecimal(entry.actualShare)));
             """
             try connection.simpleQuery(insert).wait()
         }

@@ -27,3 +27,7 @@
 ## Iteration 6
 - Added award size statistics (average and median) plus per-period award counts/averages in the CLI and JSON export.
 - Extended database sync schema and inserts to persist award size and count metrics.
+
+## Iteration 6
+- Added category/cohort target mix support with variance tracking in the CLI report and JSON export.
+- Persisted target variance snapshots to the database and documented new usage examples.
