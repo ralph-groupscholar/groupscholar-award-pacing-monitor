@@ -31,3 +31,7 @@
 ## Iteration 6
 - Added category/cohort target mix support with variance tracking in the CLI report and JSON export.
 - Persisted target variance snapshots to the database and documented new usage examples.
+
+## Iteration 7
+- Added award size band distribution and top award highlights to the CLI report and JSON export.
+- Persisted size band and top award snapshots to the database for dashboarding.

@@ -355,6 +355,8 @@ struct Summary {
     let totalAmount: Double
     let averageAward: Double
     let medianAward: Double
+    let awardBands: [AwardBandResult]
+    let topAwards: [TopAward]
     let periodTotals: [String: Double]
     let periodCounts: [String: Int]
     let periodEntries: [PeriodEntry]
@@ -401,6 +403,8 @@ struct ExportPayload: Encodable {
     let dateRange: ExportDateRange
     let filters: ExportFilters
     let totals: ExportTotals
+    let awardBands: [ExportAwardBand]
+    let topAwards: [ExportTopAward]
     let periods: [ExportPeriod]
     let missingPeriods: [String]
     let paceAlerts: [ExportPaceAlert]
@@ -431,6 +435,23 @@ struct ExportTotals: Encodable {
     let variance: Double
     let averageAward: Double
     let medianAward: Double
+}
+
+struct ExportAwardBand: Encodable {
+    let label: String
+    let minAmount: Double
+    let maxAmount: Double?
+    let recordCount: Int
+    let totalAmount: Double
+    let averageAward: Double
+    let share: Double
+}
+
+struct ExportTopAward: Encodable {
+    let date: String
+    let amount: Double
+    let category: String
+    let cohort: String
 }
 
 struct ExportPeriod: Encodable {
@@ -508,6 +529,29 @@ struct TargetVariance {
     let actualShare: Double
 }
 
+struct AwardBand {
+    let label: String
+    let minAmount: Double
+    let maxAmount: Double?
+}
+
+struct AwardBandResult {
+    let label: String
+    let minAmount: Double
+    let maxAmount: Double?
+    let recordCount: Int
+    let totalAmount: Double
+    let averageAward: Double
+    let share: Double
+}
+
+struct TopAward {
+    let date: Date
+    let amount: Double
+    let category: String
+    let cohort: String
+}
+
 func buildSummary(records: [Record], config: Config) -> Summary {
     let calendar = Calendar(identifier: .gregorian)
     var periodTotals: [String: Double] = [:]
@@ -549,12 +593,16 @@ func buildSummary(records: [Record], config: Config) -> Summary {
     let totalAmount = periodTotals.values.reduce(0, +)
     let averageAward = records.isEmpty ? 0 : totalAmount / Double(records.count)
     let medianAward = computeMedian(values: amounts)
+    let awardBands = buildAwardBands(records: records, totalAmount: totalAmount)
+    let topAwards = buildTopAwards(records: records, limit: 5)
 
     return Summary(
         totalRecords: records.count,
         totalAmount: totalAmount,
         averageAward: averageAward,
         medianAward: medianAward,
+        awardBands: awardBands,
+        topAwards: topAwards,
         periodTotals: periodTotals,
         periodCounts: periodCounts,
         periodEntries: orderedEntries,
@@ -703,6 +751,47 @@ func computeMedian(values: [Double]) -> Double {
     return sorted[mid]
 }
 
+func buildAwardBands(records: [Record], totalAmount: Double) -> [AwardBandResult] {
+    let bands: [AwardBand] = [
+        AwardBand(label: "<$1k", minAmount: 0, maxAmount: 1000),
+        AwardBand(label: "$1k-$5k", minAmount: 1000, maxAmount: 5000),
+        AwardBand(label: "$5k-$10k", minAmount: 5000, maxAmount: 10000),
+        AwardBand(label: "$10k-$25k", minAmount: 10000, maxAmount: 25000),
+        AwardBand(label: "$25k-$50k", minAmount: 25000, maxAmount: 50000),
+        AwardBand(label: ">$50k", minAmount: 50000, maxAmount: nil)
+    ]
+
+    return bands.map { band in
+        let matching = records.filter { record in
+            record.amount >= band.minAmount && (band.maxAmount == nil || record.amount < band.maxAmount!)
+        }
+        let count = matching.count
+        let total = matching.reduce(0.0) { $0 + $1.amount }
+        let average = count > 0 ? total / Double(count) : 0
+        let share = totalAmount > 0 ? total / totalAmount : 0
+        return AwardBandResult(
+            label: band.label,
+            minAmount: band.minAmount,
+            maxAmount: band.maxAmount,
+            recordCount: count,
+            totalAmount: total,
+            averageAward: average,
+            share: share
+        )
+    }
+}
+
+func buildTopAwards(records: [Record], limit: Int) -> [TopAward] {
+    let calendar = Calendar(identifier: .gregorian)
+    let sorted = records.sorted { $0.amount > $1.amount }
+    var results: [TopAward] = []
+    for record in sorted.prefix(limit) {
+        guard let date = calendar.date(from: DateComponents(year: record.year, month: record.month, day: record.day)) else { continue }
+        results.append(TopAward(date: date, amount: record.amount, category: record.category, cohort: record.cohort))
+    }
+    return results
+}
+
 func nextPeriod(from entry: PeriodEntry, period: PeriodType) -> PeriodEntry {
     let calendar = Calendar(identifier: .gregorian)
     let monthIncrement = period == .month ? 1 : 3
@@ -791,6 +880,25 @@ func exportReport(summary: Summary, config: Config, to path: String) throws {
             averageAward: summary.averageAward,
             medianAward: summary.medianAward
         ),
+        awardBands: summary.awardBands.map {
+            ExportAwardBand(
+                label: $0.label,
+                minAmount: $0.minAmount,
+                maxAmount: $0.maxAmount,
+                recordCount: $0.recordCount,
+                totalAmount: $0.totalAmount,
+                averageAward: $0.averageAward,
+                share: $0.share
+            )
+        },
+        topAwards: summary.topAwards.map {
+            ExportTopAward(
+                date: formatter.string(from: $0.date),
+                amount: $0.amount,
+                category: $0.category,
+                cohort: $0.cohort
+            )
+        },
         periods: periods,
         missingPeriods: summary.missingPeriods.map { $0.key },
         paceAlerts: summary.paceFlags.map {
@@ -997,6 +1105,31 @@ func printReport(summary: Summary, config: Config) {
             } else {
                 print("On track with recent pace.")
             }
+        }
+    }
+
+    if !summary.awardBands.isEmpty {
+        print("")
+        print("Award Size Bands")
+        let header = String(format: "%-12@ | %-6@ | %-12@ | %-12@ | %-8@", "Band" as NSString, "Count" as NSString, "Total" as NSString, "Avg Award" as NSString, "Share" as NSString)
+        print(header)
+        print(String(repeating: "-", count: 60))
+        for band in summary.awardBands {
+            let row = String(format: "%-12@ | %-6d | $%-11.2f | $%-11.2f | %-7.1f%%", band.label as NSString, band.recordCount, band.totalAmount, band.averageAward, band.share * 100)
+            print(row)
+        }
+    }
+
+    if !summary.topAwards.isEmpty {
+        print("")
+        print("Top Awards")
+        let header = String(format: "%-12@ | %-12@ | %-16@ | %-12@", "Date" as NSString, "Amount" as NSString, "Category" as NSString, "Cohort" as NSString)
+        print(header)
+        print(String(repeating: "-", count: 70))
+        for award in summary.topAwards {
+            let date = formatter.string(from: award.date)
+            let row = String(format: "%-12@ | $%-11.2f | %-16@ | %-12@", date as NSString, award.amount, award.category as NSString, award.cohort as NSString)
+            print(row)
         }
     }
 
@@ -1245,6 +1378,27 @@ func syncToDatabase(summary: Summary, config: Config) throws {
         period_key TEXT NOT NULL
     );
     """
+    let createBands = """
+    CREATE TABLE IF NOT EXISTS \(schema).size_bands (
+        snapshot_id UUID NOT NULL,
+        band_label TEXT NOT NULL,
+        min_amount NUMERIC NOT NULL,
+        max_amount NUMERIC,
+        record_count INTEGER NOT NULL,
+        total_amount NUMERIC NOT NULL,
+        average_award NUMERIC NOT NULL,
+        share NUMERIC NOT NULL
+    );
+    """
+    let createTopAwards = """
+    CREATE TABLE IF NOT EXISTS \(schema).top_awards (
+        snapshot_id UUID NOT NULL,
+        award_date DATE NOT NULL,
+        amount NUMERIC NOT NULL,
+        category TEXT NOT NULL,
+        cohort TEXT NOT NULL
+    );
+    """
 
     try connection.simpleQuery(createSnapshots).wait()
     try connection.simpleQuery(createPeriods).wait()
@@ -1253,6 +1407,8 @@ func syncToDatabase(summary: Summary, config: Config) throws {
     try connection.simpleQuery(createBreakdowns).wait()
     try connection.simpleQuery(createTargets).wait()
     try connection.simpleQuery(createMissing).wait()
+    try connection.simpleQuery(createBands).wait()
+    try connection.simpleQuery(createTopAwards).wait()
 
     try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS average_award NUMERIC NOT NULL DEFAULT 0;").wait()
     try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS median_award NUMERIC NOT NULL DEFAULT 0;").wait()
@@ -1356,6 +1512,25 @@ func syncToDatabase(summary: Summary, config: Config) throws {
             INSERT INTO \(schema).targets (snapshot_id, target_type, name, target_share, actual_amount, expected_amount, variance, actual_share)
             VALUES ('\(snapshotId)'::uuid, 'cohort', '\(sqlLiteral(entry.name))', \(sqlDecimal(entry.targetShare)),
                     \(sqlDecimal(entry.actualAmount)), \(sqlDecimal(entry.expectedAmount)), \(sqlDecimal(entry.variance)), \(sqlDecimal(entry.actualShare)));
+            """
+            try connection.simpleQuery(insert).wait()
+        }
+
+        for band in summary.awardBands {
+            let maxValue = band.maxAmount.map { sqlDecimal($0) } ?? "NULL"
+            let insert = """
+            INSERT INTO \(schema).size_bands (snapshot_id, band_label, min_amount, max_amount, record_count, total_amount, average_award, share)
+            VALUES ('\(snapshotId)'::uuid, '\(sqlLiteral(band.label))', \(sqlDecimal(band.minAmount)), \(maxValue), \(band.recordCount),
+                    \(sqlDecimal(band.totalAmount)), \(sqlDecimal(band.averageAward)), \(sqlDecimal(band.share)));
+            """
+            try connection.simpleQuery(insert).wait()
+        }
+
+        for award in summary.topAwards {
+            let insert = """
+            INSERT INTO \(schema).top_awards (snapshot_id, award_date, amount, category, cohort)
+            VALUES ('\(snapshotId)'::uuid, '\(sqlDate(award.date))', \(sqlDecimal(award.amount)),
+                    '\(sqlLiteral(award.category))', '\(sqlLiteral(award.cohort))');
             """
             try connection.simpleQuery(insert).wait()
         }

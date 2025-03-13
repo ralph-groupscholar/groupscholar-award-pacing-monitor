@@ -14,6 +14,7 @@ A Swift CLI for tracking scholarship award disbursement pacing against an annual
 - Budget runway guidance on remaining-period targets vs recent pace
 - Cumulative pacing view to see running variance
 - Period award counts plus average/median award size
+- Award size band distribution and top award highlights
 - Top category and cohort spend mix
 - Optional category/cohort target mix variance tracking
 - Optional date, category, and cohort filters to focus specific slices
