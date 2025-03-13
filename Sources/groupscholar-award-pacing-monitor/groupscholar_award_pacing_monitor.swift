@@ -1,11 +1,13 @@
 import Foundation
 import NIOPosix
 import PostgresNIO
+import Logging
 
 struct Config {
     let filePath: String
     let annualBudget: Double
     let period: PeriodType
+    let periodWeights: [Double]?
     let projectionPeriods: Int
     let startDate: Date?
     let endDate: Date?
@@ -83,6 +85,7 @@ func parseArgs(_ args: [String]) throws -> Config {
     var filePath: String?
     var budget: Double?
     var period: PeriodType = .month
+    var periodWeights: [Double]?
     var projectionPeriods = 0
     var startDate: Date?
     var endDate: Date?
@@ -119,6 +122,10 @@ func parseArgs(_ args: [String]) throws -> Config {
             guard index < args.count else { throw ArgError.missingValue("--projection-periods") }
             guard let value = Int(args[index]) else { throw ArgError.invalidValue("--projection-periods") }
             projectionPeriods = max(0, value)
+        case "--period-weights":
+            index += 1
+            guard index < args.count else { throw ArgError.missingValue("--period-weights") }
+            periodWeights = try parsePeriodWeights(args[index], flag: "--period-weights")
         case "--start-date":
             index += 1
             guard index < args.count else { throw ArgError.missingValue("--start-date") }
@@ -166,11 +173,15 @@ func parseArgs(_ args: [String]) throws -> Config {
 
     guard let filePathUnwrapped = filePath else { throw ArgError.missingRequired("--file") }
     guard let budgetUnwrapped = budget else { throw ArgError.missingRequired("--budget") }
+    if let weights = periodWeights {
+        periodWeights = try normalizePeriodWeights(weights, period: period, flag: "--period-weights")
+    }
 
     return Config(
         filePath: filePathUnwrapped,
         annualBudget: budgetUnwrapped,
         period: period,
+        periodWeights: periodWeights,
         projectionPeriods: projectionPeriods,
         startDate: startDate,
         endDate: endDate,
@@ -225,6 +236,7 @@ func printUsage() {
     Usage:
       groupscholar-award-pacing-monitor --file <csv> --budget <annual_budget> [--period month|quarter] [--projection-periods N]
                    [--start-date YYYY-MM-DD] [--end-date YYYY-MM-DD] [--category list] [--cohort list]
+                   [--period-weights list]
                    [--category-targets list] [--cohort-targets list] [--export-json path] [--db-sync] [--db-schema name]
 
     Example:
@@ -326,6 +338,28 @@ func parseTargetList(_ raw: String, flag: String) throws -> [TargetConfig] {
     return results
 }
 
+func parsePeriodWeights(_ raw: String, flag: String) throws -> [Double] {
+    let entries = raw.split(separator: ",").map { String($0) }
+    guard !entries.isEmpty else { throw ArgError.invalidValue(flag) }
+    var results: [Double] = []
+    for entry in entries {
+        let trimmed = entry.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let parsed = Double(trimmed) else { throw ArgError.invalidValue(flag) }
+        let weight = parsed > 1.0 ? parsed / 100.0 : parsed
+        guard weight >= 0 else { throw ArgError.invalidValue(flag) }
+        results.append(weight)
+    }
+    return results
+}
+
+func normalizePeriodWeights(_ raw: [Double], period: PeriodType, flag: String) throws -> [Double] {
+    let expectedCount = period == .month ? 12 : 4
+    guard raw.count == expectedCount else { throw ArgError.invalidValue(flag) }
+    let total = raw.reduce(0, +)
+    guard total > 0 else { throw ArgError.invalidValue(flag) }
+    return raw.map { $0 / total }
+}
+
 func recordDate(_ record: Record) -> Date? {
     buildDate(year: record.year, month: record.month, day: record.day)
 }
@@ -355,13 +389,23 @@ struct Summary {
     let totalAmount: Double
     let averageAward: Double
     let medianAward: Double
+    let awardStdDev: Double
+    let awardCoeffVar: Double
+    let topAwardShare: Double
+    let topFiveShare: Double
     let awardBands: [AwardBandResult]
     let topAwards: [TopAward]
+    let cadence: CadenceMetrics
     let periodTotals: [String: Double]
     let periodCounts: [String: Int]
     let periodEntries: [PeriodEntry]
     let missingPeriods: [PeriodEntry]
+    let inactiveStreaks: [InactiveStreak]
     let expectedPerPeriod: Double
+    let weightedExpectations: [String: Double]?
+    let weightedExpectedTotal: Double?
+    let weightedVariance: Double?
+    let weightedPace: Double?
     let periodType: PeriodType
     let startDate: Date
     let endDate: Date
@@ -369,6 +413,7 @@ struct Summary {
     let categoryTotals: [String: Double]
     let cohortTotals: [String: Double]
     let paceFlags: [PaceFlag]
+    let weightedPaceFlags: [PaceFlag]
     let yearTotals: [Int: Double]
     let yearPeriods: [Int: Set<String>]
     let periodDeltas: [PeriodDelta]
@@ -389,6 +434,14 @@ struct PeriodDelta {
     let percent: Double?
 }
 
+struct InactiveStreak {
+    let start: PeriodEntry
+    let end: PeriodEntry
+    let length: Int
+    let totalExpected: Double
+    let totalActual: Double
+}
+
 struct CumulativeEntry {
     let entry: PeriodEntry
     let actual: Double
@@ -400,20 +453,25 @@ struct ExportPayload: Encodable {
     let generatedAt: String
     let periodType: String
     let annualBudget: Double
+    let periodWeights: [Double]?
     let dateRange: ExportDateRange
     let filters: ExportFilters
     let totals: ExportTotals
+    let cadence: ExportCadence?
     let awardBands: [ExportAwardBand]
     let topAwards: [ExportTopAward]
     let periods: [ExportPeriod]
     let missingPeriods: [String]
+    let inactiveStreaks: [ExportInactiveStreak]
     let paceAlerts: [ExportPaceAlert]
+    let seasonalityAlerts: [ExportPaceAlert]?
     let projection: [ExportProjection]
     let topCategories: [ExportBreakdown]
     let topCohorts: [ExportBreakdown]
     let categoryTargets: [ExportTargetVariance]?
     let cohortTargets: [ExportTargetVariance]?
     let runway: ExportRunway?
+    let concentration: ExportConcentration
 }
 
 struct ExportDateRange: Encodable {
@@ -433,8 +491,26 @@ struct ExportTotals: Encodable {
     let actual: Double
     let expected: Double
     let variance: Double
+    let weightedExpected: Double?
+    let weightedVariance: Double?
+    let weightedPace: Double?
     let averageAward: Double
     let medianAward: Double
+    let awardStdDev: Double
+    let awardCoeffVar: Double
+}
+
+struct ExportConcentration: Encodable {
+    let topAwardShare: Double
+    let topFiveShare: Double
+}
+
+struct ExportCadence: Encodable {
+    let gapCount: Int
+    let averageGapDays: Double?
+    let medianGapDays: Double?
+    let maxGapDays: Int?
+    let recentGapDays: Int?
 }
 
 struct ExportAwardBand: Encodable {
@@ -458,7 +534,10 @@ struct ExportPeriod: Encodable {
     let key: String
     let actual: Double
     let expected: Double
+    let weightedExpected: Double?
+    let weightedVariance: Double?
     let pace: Double
+    let weightedPace: Double?
     let recordCount: Int
     let averageAward: Double
     let cumulativeActual: Double
@@ -472,6 +551,14 @@ struct ExportPaceAlert: Encodable {
     let expected: Double
     let variance: Double
     let pace: Double
+}
+
+struct ExportInactiveStreak: Encodable {
+    let startPeriod: String
+    let endPeriod: String
+    let length: Int
+    let expectedTotal: Double
+    let actualTotal: Double
 }
 
 struct ExportProjection: Encodable {
@@ -552,6 +639,14 @@ struct TopAward {
     let cohort: String
 }
 
+struct CadenceMetrics {
+    let gapCount: Int
+    let averageGapDays: Double?
+    let medianGapDays: Double?
+    let maxGapDays: Int?
+    let recentGapDays: Int?
+}
+
 func buildSummary(records: [Record], config: Config) -> Summary {
     let calendar = Calendar(identifier: .gregorian)
     var periodTotals: [String: Double] = [:]
@@ -591,23 +686,44 @@ func buildSummary(records: [Record], config: Config) -> Summary {
     let projection = buildProjection(entries: orderedEntries, totals: periodTotals, config: config)
     let paceFlags = buildPaceFlags(entries: orderedEntries, totals: periodTotals, expectedPerPeriod: expectedPerPeriod)
     let totalAmount = periodTotals.values.reduce(0, +)
+    let weightedExpectations = buildWeightedExpectations(entries: orderedEntries, config: config)
+    let weightedPaceFlags = buildWeightedPaceFlags(entries: orderedEntries, totals: periodTotals, expectedByPeriod: weightedExpectations)
+    let weightedExpectedTotal = weightedExpectations?.values.reduce(0, +)
+    let weightedVariance = weightedExpectedTotal.map { totalAmount - $0 }
+    let weightedPace = weightedExpectedTotal.map { $0 > 0 ? totalAmount / $0 : 0 }
+    let inactiveStreaks = buildInactiveStreaks(entries: orderedEntries, totals: periodTotals, period: config.period, expectedPerPeriod: expectedPerPeriod)
     let averageAward = records.isEmpty ? 0 : totalAmount / Double(records.count)
     let medianAward = computeMedian(values: amounts)
+    let awardStdDev = computeStdDev(values: amounts)
+    let awardCoeffVar = averageAward > 0 ? awardStdDev / averageAward : 0
+    let topAwardShare = computeConcentration(values: amounts, topCount: 1)
+    let topFiveShare = computeConcentration(values: amounts, topCount: 5)
     let awardBands = buildAwardBands(records: records, totalAmount: totalAmount)
     let topAwards = buildTopAwards(records: records, limit: 5)
+    let cadence = buildCadence(records: records)
 
     return Summary(
         totalRecords: records.count,
         totalAmount: totalAmount,
         averageAward: averageAward,
         medianAward: medianAward,
+        awardStdDev: awardStdDev,
+        awardCoeffVar: awardCoeffVar,
+        topAwardShare: topAwardShare,
+        topFiveShare: topFiveShare,
         awardBands: awardBands,
         topAwards: topAwards,
+        cadence: cadence,
         periodTotals: periodTotals,
         periodCounts: periodCounts,
         periodEntries: orderedEntries,
         missingPeriods: missingPeriods,
+        inactiveStreaks: inactiveStreaks,
         expectedPerPeriod: expectedPerPeriod,
+        weightedExpectations: weightedExpectations,
+        weightedExpectedTotal: weightedExpectedTotal,
+        weightedVariance: weightedVariance,
+        weightedPace: weightedPace,
         periodType: config.period,
         startDate: minDate,
         endDate: maxDate,
@@ -615,10 +731,55 @@ func buildSummary(records: [Record], config: Config) -> Summary {
         categoryTotals: categoryTotals,
         cohortTotals: cohortTotals,
         paceFlags: paceFlags,
+        weightedPaceFlags: weightedPaceFlags,
         yearTotals: yearTotals,
         yearPeriods: yearPeriods,
         periodDeltas: periodDeltas
     )
+}
+
+func periodWeightIndex(for entry: PeriodEntry, period: PeriodType) -> Int? {
+    switch period {
+    case .month:
+        let parts = entry.key.split(separator: "-")
+        guard parts.count == 2, let month = Int(parts[1]), month >= 1 else { return nil }
+        return month - 1
+    case .quarter:
+        guard let range = entry.key.range(of: "-Q") else { return nil }
+        let quarterValue = entry.key[range.upperBound...]
+        guard let quarter = Int(quarterValue), quarter >= 1 else { return nil }
+        return quarter - 1
+    }
+}
+
+func buildWeightedExpectations(entries: [PeriodEntry], config: Config) -> [String: Double]? {
+    guard let weights = config.periodWeights else { return nil }
+    var expectations: [String: Double] = [:]
+    for entry in entries {
+        guard let index = periodWeightIndex(for: entry, period: config.period),
+              index < weights.count else { continue }
+        expectations[entry.key] = config.annualBudget * weights[index]
+    }
+    return expectations
+}
+
+func buildWeightedPaceFlags(entries: [PeriodEntry], totals: [String: Double], expectedByPeriod: [String: Double]?) -> [PaceFlag] {
+    guard let expectedByPeriod = expectedByPeriod else { return [] }
+    let lowerBound = 0.8
+    let upperBound = 1.2
+    var flags: [PaceFlag] = []
+
+    for entry in entries {
+        guard let expected = expectedByPeriod[entry.key], expected > 0 else { continue }
+        let actual = totals[entry.key] ?? 0
+        let pace = actual / expected
+        if pace < lowerBound || pace > upperBound {
+            let variance = actual - expected
+            flags.append(PaceFlag(period: entry.key, actual: actual, expected: expected, variance: variance, pace: pace))
+        }
+    }
+
+    return flags.sorted { abs($0.variance) > abs($1.variance) }
 }
 
 func periodKey(for record: Record, period: PeriodType, calendar: Calendar) -> PeriodEntry {
@@ -726,6 +887,67 @@ func buildPeriodDeltas(entries: [PeriodEntry], totals: [String: Double]) -> [Per
     return deltas
 }
 
+func buildInactiveStreaks(entries: [PeriodEntry], totals: [String: Double], period: PeriodType, expectedPerPeriod: Double) -> [InactiveStreak] {
+    guard let first = entries.first, let last = entries.last else { return [] }
+    var streaks: [InactiveStreak] = []
+    var cursor = first
+    var currentStart: PeriodEntry?
+    var currentLength = 0
+    var currentActual = 0.0
+    var lastInactive: PeriodEntry?
+
+    while cursor.date <= last.date {
+        let actual = totals[cursor.key] ?? 0
+        let isInactive = actual == 0
+
+        if isInactive {
+            if currentStart == nil {
+                currentStart = cursor
+                currentLength = 0
+                currentActual = 0
+            }
+            currentLength += 1
+            currentActual += actual
+            lastInactive = cursor
+        } else if let start = currentStart, let end = lastInactive {
+            streaks.append(
+                InactiveStreak(
+                    start: start,
+                    end: end,
+                    length: currentLength,
+                    totalExpected: expectedPerPeriod * Double(currentLength),
+                    totalActual: currentActual
+                )
+            )
+            currentStart = nil
+            currentLength = 0
+            currentActual = 0
+            lastInactive = nil
+        }
+
+        cursor = nextPeriod(from: cursor, period: period)
+    }
+
+    if let start = currentStart, let end = lastInactive {
+        streaks.append(
+            InactiveStreak(
+                start: start,
+                end: end,
+                length: currentLength,
+                totalExpected: expectedPerPeriod * Double(currentLength),
+                totalActual: currentActual
+            )
+        )
+    }
+
+    return streaks.sorted {
+        if $0.length == $1.length {
+            return $0.start.date < $1.start.date
+        }
+        return $0.length > $1.length
+    }
+}
+
 func buildCumulative(entries: [PeriodEntry], totals: [String: Double], expectedPerPeriod: Double) -> [CumulativeEntry] {
     var cumulativeActual = 0.0
     var results: [CumulativeEntry] = []
@@ -749,6 +971,21 @@ func computeMedian(values: [Double]) -> Double {
         return (sorted[mid - 1] + sorted[mid]) / 2
     }
     return sorted[mid]
+}
+
+func computeStdDev(values: [Double]) -> Double {
+    guard !values.isEmpty else { return 0 }
+    let mean = values.reduce(0, +) / Double(values.count)
+    let variance = values.reduce(0) { $0 + pow($1 - mean, 2) } / Double(values.count)
+    return sqrt(variance)
+}
+
+func computeConcentration(values: [Double], topCount: Int) -> Double {
+    guard topCount > 0 else { return 0 }
+    let total = values.reduce(0, +)
+    guard total > 0 else { return 0 }
+    let top = values.sorted(by: >).prefix(topCount).reduce(0, +)
+    return top / total
 }
 
 func buildAwardBands(records: [Record], totalAmount: Double) -> [AwardBandResult] {
@@ -790,6 +1027,40 @@ func buildTopAwards(records: [Record], limit: Int) -> [TopAward] {
         results.append(TopAward(date: date, amount: record.amount, category: record.category, cohort: record.cohort))
     }
     return results
+}
+
+func buildCadence(records: [Record]) -> CadenceMetrics {
+    let calendar = Calendar(identifier: .gregorian)
+    var uniqueDays = Set<Date>()
+
+    for record in records {
+        guard let date = calendar.date(from: DateComponents(year: record.year, month: record.month, day: record.day)) else { continue }
+        uniqueDays.insert(calendar.startOfDay(for: date))
+    }
+
+    let orderedDays = uniqueDays.sorted()
+    guard orderedDays.count > 1 else {
+        return CadenceMetrics(gapCount: 0, averageGapDays: nil, medianGapDays: nil, maxGapDays: nil, recentGapDays: nil)
+    }
+
+    var gaps: [Int] = []
+    for index in 1..<orderedDays.count {
+        let gap = calendar.dateComponents([.day], from: orderedDays[index - 1], to: orderedDays[index]).day ?? 0
+        gaps.append(max(0, gap))
+    }
+
+    let average = Double(gaps.reduce(0, +)) / Double(gaps.count)
+    let median = computeMedian(values: gaps.map { Double($0) })
+    let maxGap = gaps.max()
+    let recentGap = gaps.last
+
+    return CadenceMetrics(
+        gapCount: gaps.count,
+        averageGapDays: average,
+        medianGapDays: median,
+        maxGapDays: maxGap,
+        recentGapDays: recentGap
+    )
 }
 
 func nextPeriod(from entry: PeriodEntry, period: PeriodType) -> PeriodEntry {
@@ -834,6 +1105,9 @@ func exportReport(summary: Summary, config: Config, to path: String) throws {
     let periods: [ExportPeriod] = summary.periodEntries.enumerated().map { index, entry in
         let actual = summary.periodTotals[entry.key] ?? 0
         let pace = summary.expectedPerPeriod > 0 ? actual / summary.expectedPerPeriod : 0
+        let weightedExpected = summary.weightedExpectations?[entry.key]
+        let weightedVariance = weightedExpected.map { actual - $0 }
+        let weightedPace = weightedExpected.flatMap { $0 > 0 ? actual / $0 : nil }
         let recordCount = summary.periodCounts[entry.key] ?? 0
         let averageAward = recordCount > 0 ? actual / Double(recordCount) : 0
         let cumulativeEntry = cumulative[index]
@@ -841,7 +1115,10 @@ func exportReport(summary: Summary, config: Config, to path: String) throws {
             key: entry.key,
             actual: actual,
             expected: summary.expectedPerPeriod,
+            weightedExpected: weightedExpected,
+            weightedVariance: weightedVariance,
             pace: pace,
+            weightedPace: weightedPace,
             recordCount: recordCount,
             averageAward: averageAward,
             cumulativeActual: cumulativeEntry.actual,
@@ -862,6 +1139,7 @@ func exportReport(summary: Summary, config: Config, to path: String) throws {
         generatedAt: formatter.string(from: Date()),
         periodType: summary.periodType.rawValue,
         annualBudget: config.annualBudget,
+        periodWeights: config.periodWeights,
         dateRange: ExportDateRange(
             start: formatter.string(from: summary.startDate),
             end: formatter.string(from: summary.endDate)
@@ -877,9 +1155,21 @@ func exportReport(summary: Summary, config: Config, to path: String) throws {
             actual: summary.totalAmount,
             expected: expectedTotal,
             variance: variance,
+            weightedExpected: summary.weightedExpectedTotal,
+            weightedVariance: summary.weightedVariance,
+            weightedPace: summary.weightedPace,
             averageAward: summary.averageAward,
-            medianAward: summary.medianAward
+            medianAward: summary.medianAward,
+            awardStdDev: summary.awardStdDev,
+            awardCoeffVar: summary.awardCoeffVar
         ),
+        cadence: summary.cadence.gapCount > 0 ? ExportCadence(
+            gapCount: summary.cadence.gapCount,
+            averageGapDays: summary.cadence.averageGapDays,
+            medianGapDays: summary.cadence.medianGapDays,
+            maxGapDays: summary.cadence.maxGapDays,
+            recentGapDays: summary.cadence.recentGapDays
+        ) : nil,
         awardBands: summary.awardBands.map {
             ExportAwardBand(
                 label: $0.label,
@@ -901,7 +1191,19 @@ func exportReport(summary: Summary, config: Config, to path: String) throws {
         },
         periods: periods,
         missingPeriods: summary.missingPeriods.map { $0.key },
+        inactiveStreaks: summary.inactiveStreaks.map {
+            ExportInactiveStreak(
+                startPeriod: $0.start.key,
+                endPeriod: $0.end.key,
+                length: $0.length,
+                expectedTotal: $0.totalExpected,
+                actualTotal: $0.totalActual
+            )
+        },
         paceAlerts: summary.paceFlags.map {
+            ExportPaceAlert(period: $0.period, actual: $0.actual, expected: $0.expected, variance: $0.variance, pace: $0.pace)
+        },
+        seasonalityAlerts: summary.weightedPaceFlags.isEmpty ? nil : summary.weightedPaceFlags.map {
             ExportPaceAlert(period: $0.period, actual: $0.actual, expected: $0.expected, variance: $0.variance, pace: $0.pace)
         },
         projection: projections,
@@ -940,7 +1242,11 @@ func exportReport(summary: Summary, config: Config, to path: String) throws {
                 recentPeriods: $0.recentPeriods,
                 deltaVsRecent: $0.deltaVsRecent
             )
-        }
+        },
+        concentration: ExportConcentration(
+            topAwardShare: summary.topAwardShare,
+            topFiveShare: summary.topFiveShare
+        )
     )
 
     let encoder = JSONEncoder()
@@ -966,6 +1272,12 @@ func printReport(summary: Summary, config: Config) {
     print(String(format: "Variance: $%.2f", variance))
     print(String(format: "Average award: $%.2f", summary.averageAward))
     print(String(format: "Median award: $%.2f", summary.medianAward))
+    print(String(format: "Award std dev: $%.2f", summary.awardStdDev))
+    print(String(format: "Award coeff var: %.2f", summary.awardCoeffVar))
+    if summary.cadence.gapCount > 0 {
+        print(String(format: "Award cadence avg gap: %.1f days", summary.cadence.averageGapDays ?? 0))
+        print(String(format: "Award cadence median gap: %.1f days", summary.cadence.medianGapDays ?? 0))
+    }
 
     if config.startDate != nil || config.endDate != nil || !config.categoryFilters.isEmpty || !config.cohortFilters.isEmpty {
         print("")
@@ -1023,6 +1335,17 @@ func printReport(summary: Summary, config: Config) {
         }
     }
 
+    if !summary.inactiveStreaks.isEmpty {
+        print("")
+        print("Inactive Period Streaks")
+        for streak in summary.inactiveStreaks.prefix(3) {
+            let range = "\(streak.start.key) -> \(streak.end.key)"
+            let row = String(format: "%2d periods | %-19@ | Expected $%-10.2f | Actual $%-10.2f",
+                             streak.length, range as NSString, streak.totalExpected, streak.totalActual)
+            print(row)
+        }
+    }
+
     let increases = summary.periodDeltas.filter { $0.delta > 0 }.sorted { $0.delta > $1.delta }
     let decreases = summary.periodDeltas.filter { $0.delta < 0 }.sorted { $0.delta < $1.delta }
     if !increases.isEmpty || !decreases.isEmpty {
@@ -1060,6 +1383,35 @@ func printReport(summary: Summary, config: Config) {
         for flag in summary.paceFlags.prefix(6) {
             let row = String(format: "%-10@ | $%-11.2f | $%-11.2f | %-7.0f%%", flag.period as NSString, flag.actual, flag.expected, flag.pace * 100)
             print(row)
+        }
+    }
+
+    if summary.weightedExpectations != nil {
+        print("")
+        print("Seasonality Pacing (weighted expectations)")
+        if let configWeights = config.periodWeights, !configWeights.isEmpty {
+            let weightLabel = configWeights.map { String(format: "%.1f%%", $0 * 100) }.joined(separator: ", ")
+            print("Weights: \(weightLabel)")
+        }
+        if let weightedExpectedTotal = summary.weightedExpectedTotal {
+            print(String(format: "Weighted expected total: $%.2f", weightedExpectedTotal))
+        }
+        if let weightedVariance = summary.weightedVariance {
+            print(String(format: "Weighted variance: $%.2f", weightedVariance))
+        }
+        if let weightedPace = summary.weightedPace {
+            print(String(format: "Weighted pace: %.0f%%", weightedPace * 100))
+        }
+        if summary.weightedPaceFlags.isEmpty {
+            print("No seasonality alerts.")
+        } else {
+            let header = String(format: "%-10@ | %-12@ | %-12@ | %-8@", "Period" as NSString, "Actual" as NSString, "Expected" as NSString, "Pace" as NSString)
+            print(header)
+            print(String(repeating: "-", count: 52))
+            for flag in summary.weightedPaceFlags.prefix(6) {
+                let row = String(format: "%-10@ | $%-11.2f | $%-11.2f | %-7.0f%%", flag.period as NSString, flag.actual, flag.expected, flag.pace * 100)
+                print(row)
+            }
         }
     }
 
@@ -1108,6 +1460,24 @@ func printReport(summary: Summary, config: Config) {
         }
     }
 
+    if summary.cadence.gapCount > 0 {
+        print("")
+        print("Award Cadence")
+        print("Award days tracked: \(summary.cadence.gapCount + 1)")
+        if let average = summary.cadence.averageGapDays {
+            print(String(format: "Average gap: %.1f days", average))
+        }
+        if let median = summary.cadence.medianGapDays {
+            print(String(format: "Median gap: %.1f days", median))
+        }
+        if let maxGap = summary.cadence.maxGapDays {
+            print(String(format: "Longest gap: %d days", maxGap))
+        }
+        if let recentGap = summary.cadence.recentGapDays {
+            print(String(format: "Most recent gap: %d days", recentGap))
+        }
+    }
+
     if !summary.awardBands.isEmpty {
         print("")
         print("Award Size Bands")
@@ -1132,6 +1502,11 @@ func printReport(summary: Summary, config: Config) {
             print(row)
         }
     }
+
+    print("")
+    print("Award Concentration")
+    print(String(format: "Top award share: %.1f%%", summary.topAwardShare * 100))
+    print(String(format: "Top 5 awards share: %.1f%%", summary.topFiveShare * 100))
 
     let topCategory = topBreakdown(title: "Top Categories", totals: summary.categoryTotals, totalAmount: summary.totalAmount)
     if !topCategory.isEmpty {
@@ -1315,8 +1690,20 @@ func syncToDatabase(summary: Summary, config: Config) throws {
         total_amount NUMERIC NOT NULL,
         expected_total NUMERIC NOT NULL,
         variance NUMERIC NOT NULL,
+        weighted_expected_total NUMERIC NOT NULL,
+        weighted_variance NUMERIC NOT NULL,
+        weighted_pace NUMERIC NOT NULL,
         average_award NUMERIC NOT NULL,
         median_award NUMERIC NOT NULL,
+        award_std_dev NUMERIC NOT NULL,
+        award_coeff_var NUMERIC NOT NULL,
+        top_award_share NUMERIC NOT NULL,
+        top_five_share NUMERIC NOT NULL,
+        gap_count INTEGER NOT NULL,
+        average_gap_days NUMERIC NOT NULL,
+        median_gap_days NUMERIC NOT NULL,
+        max_gap_days INTEGER NOT NULL,
+        recent_gap_days INTEGER NOT NULL,
         filters_json TEXT NOT NULL
     );
     """
@@ -1327,6 +1714,9 @@ func syncToDatabase(summary: Summary, config: Config) throws {
         actual NUMERIC NOT NULL,
         expected NUMERIC NOT NULL,
         pace NUMERIC NOT NULL,
+        weighted_expected NUMERIC NOT NULL,
+        weighted_variance NUMERIC NOT NULL,
+        weighted_pace NUMERIC NOT NULL,
         record_count INTEGER NOT NULL,
         average_award NUMERIC NOT NULL,
         cumulative_actual NUMERIC NOT NULL,
@@ -1336,6 +1726,16 @@ func syncToDatabase(summary: Summary, config: Config) throws {
     """
     let createPaceAlerts = """
     CREATE TABLE IF NOT EXISTS \(schema).pace_alerts (
+        snapshot_id UUID NOT NULL,
+        period_key TEXT NOT NULL,
+        actual NUMERIC NOT NULL,
+        expected NUMERIC NOT NULL,
+        variance NUMERIC NOT NULL,
+        pace NUMERIC NOT NULL
+    );
+    """
+    let createSeasonalityAlerts = """
+    CREATE TABLE IF NOT EXISTS \(schema).seasonality_alerts (
         snapshot_id UUID NOT NULL,
         period_key TEXT NOT NULL,
         actual NUMERIC NOT NULL,
@@ -1378,6 +1778,16 @@ func syncToDatabase(summary: Summary, config: Config) throws {
         period_key TEXT NOT NULL
     );
     """
+    let createInactiveStreaks = """
+    CREATE TABLE IF NOT EXISTS \(schema).inactive_streaks (
+        snapshot_id UUID NOT NULL,
+        start_period TEXT NOT NULL,
+        end_period TEXT NOT NULL,
+        length INTEGER NOT NULL,
+        expected_total NUMERIC NOT NULL,
+        actual_total NUMERIC NOT NULL
+    );
+    """
     let createBands = """
     CREATE TABLE IF NOT EXISTS \(schema).size_bands (
         snapshot_id UUID NOT NULL,
@@ -1403,32 +1813,60 @@ func syncToDatabase(summary: Summary, config: Config) throws {
     try connection.simpleQuery(createSnapshots).wait()
     try connection.simpleQuery(createPeriods).wait()
     try connection.simpleQuery(createPaceAlerts).wait()
+    try connection.simpleQuery(createSeasonalityAlerts).wait()
     try connection.simpleQuery(createProjections).wait()
     try connection.simpleQuery(createBreakdowns).wait()
     try connection.simpleQuery(createTargets).wait()
     try connection.simpleQuery(createMissing).wait()
+    try connection.simpleQuery(createInactiveStreaks).wait()
     try connection.simpleQuery(createBands).wait()
     try connection.simpleQuery(createTopAwards).wait()
 
     try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS average_award NUMERIC NOT NULL DEFAULT 0;").wait()
     try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS median_award NUMERIC NOT NULL DEFAULT 0;").wait()
+    try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS award_std_dev NUMERIC NOT NULL DEFAULT 0;").wait()
+    try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS award_coeff_var NUMERIC NOT NULL DEFAULT 0;").wait()
+    try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS top_award_share NUMERIC NOT NULL DEFAULT 0;").wait()
+    try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS top_five_share NUMERIC NOT NULL DEFAULT 0;").wait()
+    try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS weighted_expected_total NUMERIC NOT NULL DEFAULT 0;").wait()
+    try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS weighted_variance NUMERIC NOT NULL DEFAULT 0;").wait()
+    try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS weighted_pace NUMERIC NOT NULL DEFAULT 0;").wait()
+    try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS gap_count INTEGER NOT NULL DEFAULT 0;").wait()
+    try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS average_gap_days NUMERIC NOT NULL DEFAULT 0;").wait()
+    try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS median_gap_days NUMERIC NOT NULL DEFAULT 0;").wait()
+    try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS max_gap_days INTEGER NOT NULL DEFAULT 0;").wait()
+    try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS recent_gap_days INTEGER NOT NULL DEFAULT 0;").wait()
     try connection.simpleQuery("ALTER TABLE \(schema).periods ADD COLUMN IF NOT EXISTS record_count INTEGER NOT NULL DEFAULT 0;").wait()
     try connection.simpleQuery("ALTER TABLE \(schema).periods ADD COLUMN IF NOT EXISTS average_award NUMERIC NOT NULL DEFAULT 0;").wait()
+    try connection.simpleQuery("ALTER TABLE \(schema).periods ADD COLUMN IF NOT EXISTS weighted_expected NUMERIC NOT NULL DEFAULT 0;").wait()
+    try connection.simpleQuery("ALTER TABLE \(schema).periods ADD COLUMN IF NOT EXISTS weighted_variance NUMERIC NOT NULL DEFAULT 0;").wait()
+    try connection.simpleQuery("ALTER TABLE \(schema).periods ADD COLUMN IF NOT EXISTS weighted_pace NUMERIC NOT NULL DEFAULT 0;").wait()
 
     let snapshotId = UUID().uuidString
     let generatedAt = Date()
     let totalPeriods = summary.periodEntries.count
     let expectedTotal = summary.expectedPerPeriod * Double(totalPeriods)
     let variance = summary.totalAmount - expectedTotal
+    let weightedExpectedTotal = summary.weightedExpectedTotal ?? 0
+    let weightedVariance = summary.weightedVariance ?? 0
+    let weightedPace = summary.weightedPace ?? 0
     let filtersJson = try encodeFiltersJson(config: config)
 
     let snapshotInsert = """
     INSERT INTO \(schema).snapshots
-        (snapshot_id, generated_at, period_type, annual_budget, start_date, end_date, total_records, total_amount, expected_total, variance, average_award, median_award, filters_json)
+        (snapshot_id, generated_at, period_type, annual_budget, start_date, end_date, total_records, total_amount, expected_total, variance,
+         weighted_expected_total, weighted_variance, weighted_pace,
+         average_award, median_award, award_std_dev, award_coeff_var, top_award_share, top_five_share, gap_count, average_gap_days,
+         median_gap_days, max_gap_days, recent_gap_days, filters_json)
     VALUES
         ('\(snapshotId)'::uuid, '\(sqlTimestamp(generatedAt))', '\(sqlLiteral(summary.periodType.rawValue))', \(sqlDecimal(config.annualBudget)),
          '\(sqlDate(summary.startDate))', '\(sqlDate(summary.endDate))', \(summary.totalRecords), \(sqlDecimal(summary.totalAmount)),
-         \(sqlDecimal(expectedTotal)), \(sqlDecimal(variance)), \(sqlDecimal(summary.averageAward)), \(sqlDecimal(summary.medianAward)), '\(sqlLiteral(filtersJson))');
+         \(sqlDecimal(expectedTotal)), \(sqlDecimal(variance)), \(sqlDecimal(weightedExpectedTotal)), \(sqlDecimal(weightedVariance)),
+         \(sqlDecimal(weightedPace)), \(sqlDecimal(summary.averageAward)), \(sqlDecimal(summary.medianAward)),
+         \(sqlDecimal(summary.awardStdDev)), \(sqlDecimal(summary.awardCoeffVar)), \(sqlDecimal(summary.topAwardShare)), \(sqlDecimal(summary.topFiveShare)),
+         \(summary.cadence.gapCount), \(sqlDecimal(summary.cadence.averageGapDays ?? 0)), \(sqlDecimal(summary.cadence.medianGapDays ?? 0)),
+         \(summary.cadence.maxGapDays ?? 0), \(summary.cadence.recentGapDays ?? 0),
+         '\(sqlLiteral(filtersJson))');
     """
 
     do {
@@ -1440,15 +1878,19 @@ func syncToDatabase(summary: Summary, config: Config) throws {
             let actual = summary.periodTotals[entry.key] ?? 0
             let expected = summary.expectedPerPeriod
             let pace = expected > 0 ? actual / expected : 0
+            let weightedExpected = summary.weightedExpectations?[entry.key] ?? 0
+            let weightedVariance = actual - weightedExpected
+            let weightedPace = weightedExpected > 0 ? actual / weightedExpected : 0
             let recordCount = summary.periodCounts[entry.key] ?? 0
             let averageAward = recordCount > 0 ? actual / Double(recordCount) : 0
             let cumulativeEntry = cumulative[index]
             let insert = """
             INSERT INTO \(schema).periods
-                (snapshot_id, period_key, actual, expected, pace, record_count, average_award, cumulative_actual, cumulative_expected, cumulative_variance)
+                (snapshot_id, period_key, actual, expected, pace, weighted_expected, weighted_variance, weighted_pace, record_count, average_award, cumulative_actual, cumulative_expected, cumulative_variance)
             VALUES
                 ('\(snapshotId)'::uuid, '\(sqlLiteral(entry.key))', \(sqlDecimal(actual)), \(sqlDecimal(expected)),
-                 \(sqlDecimal(pace)), \(recordCount), \(sqlDecimal(averageAward)), \(sqlDecimal(cumulativeEntry.actual)), \(sqlDecimal(cumulativeEntry.expected)), \(sqlDecimal(cumulativeEntry.variance)));
+                 \(sqlDecimal(pace)), \(sqlDecimal(weightedExpected)), \(sqlDecimal(weightedVariance)), \(sqlDecimal(weightedPace)),
+                 \(recordCount), \(sqlDecimal(averageAward)), \(sqlDecimal(cumulativeEntry.actual)), \(sqlDecimal(cumulativeEntry.expected)), \(sqlDecimal(cumulativeEntry.variance)));
             """
             try connection.simpleQuery(insert).wait()
         }
@@ -1461,9 +1903,27 @@ func syncToDatabase(summary: Summary, config: Config) throws {
             try connection.simpleQuery(insert).wait()
         }
 
+        for streak in summary.inactiveStreaks {
+            let insert = """
+            INSERT INTO \(schema).inactive_streaks (snapshot_id, start_period, end_period, length, expected_total, actual_total)
+            VALUES ('\(snapshotId)'::uuid, '\(sqlLiteral(streak.start.key))', '\(sqlLiteral(streak.end.key))', \(streak.length),
+                    \(sqlDecimal(streak.totalExpected)), \(sqlDecimal(streak.totalActual)));
+            """
+            try connection.simpleQuery(insert).wait()
+        }
+
         for alert in summary.paceFlags {
             let insert = """
             INSERT INTO \(schema).pace_alerts (snapshot_id, period_key, actual, expected, variance, pace)
+            VALUES ('\(snapshotId)'::uuid, '\(sqlLiteral(alert.period))', \(sqlDecimal(alert.actual)), \(sqlDecimal(alert.expected)),
+                    \(sqlDecimal(alert.variance)), \(sqlDecimal(alert.pace)));
+            """
+            try connection.simpleQuery(insert).wait()
+        }
+
+        for alert in summary.weightedPaceFlags {
+            let insert = """
+            INSERT INTO \(schema).seasonality_alerts (snapshot_id, period_key, actual, expected, variance, pace)
             VALUES ('\(snapshotId)'::uuid, '\(sqlLiteral(alert.period))', \(sqlDecimal(alert.actual)), \(sqlDecimal(alert.expected)),
                     \(sqlDecimal(alert.variance)), \(sqlDecimal(alert.pace)));
             """

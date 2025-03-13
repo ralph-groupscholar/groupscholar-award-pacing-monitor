@@ -35,3 +35,7 @@
 ## Iteration 7
 - Added award size band distribution and top award highlights to the CLI report and JSON export.
 - Persisted size band and top award snapshots to the database for dashboarding.
+
+## Iteration 8
+- Added seasonality-weighted expectations using period weights with weighted pacing alerts in the CLI and JSON export.
+- Persisted weighted period metrics and seasonality alerts to the database schema, plus added seasonality unit tests.
