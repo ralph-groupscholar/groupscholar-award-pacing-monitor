@@ -396,6 +396,7 @@ struct Summary {
     let awardBands: [AwardBandResult]
     let topAwards: [TopAward]
     let cadence: CadenceMetrics
+    let periodStats: PeriodStats
     let periodTotals: [String: Double]
     let periodCounts: [String: Int]
     let periodEntries: [PeriodEntry]
@@ -457,6 +458,7 @@ struct ExportPayload: Encodable {
     let dateRange: ExportDateRange
     let filters: ExportFilters
     let totals: ExportTotals
+    let periodStats: ExportPeriodStats
     let cadence: ExportCadence?
     let awardBands: [ExportAwardBand]
     let topAwards: [ExportTopAward]
@@ -498,6 +500,18 @@ struct ExportTotals: Encodable {
     let medianAward: Double
     let awardStdDev: Double
     let awardCoeffVar: Double
+}
+
+struct ExportPeriodStats: Encodable {
+    let average: Double
+    let median: Double
+    let stdDev: Double
+    let coeffVar: Double
+    let min: Double
+    let max: Double
+    let recentAverage: Double?
+    let recentMomentum: Double?
+    let recentPeriods: [String]
 }
 
 struct ExportConcentration: Encodable {
@@ -647,6 +661,18 @@ struct CadenceMetrics {
     let recentGapDays: Int?
 }
 
+struct PeriodStats {
+    let average: Double
+    let median: Double
+    let stdDev: Double
+    let coeffVar: Double
+    let min: Double
+    let max: Double
+    let recentAverage: Double?
+    let recentMomentum: Double?
+    let recentPeriods: [String]
+}
+
 func buildSummary(records: [Record], config: Config) -> Summary {
     let calendar = Calendar(identifier: .gregorian)
     var periodTotals: [String: Double] = [:]
@@ -701,6 +727,7 @@ func buildSummary(records: [Record], config: Config) -> Summary {
     let awardBands = buildAwardBands(records: records, totalAmount: totalAmount)
     let topAwards = buildTopAwards(records: records, limit: 5)
     let cadence = buildCadence(records: records)
+    let periodStats = buildPeriodStats(entries: orderedEntries, totals: periodTotals)
 
     return Summary(
         totalRecords: records.count,
@@ -714,6 +741,7 @@ func buildSummary(records: [Record], config: Config) -> Summary {
         awardBands: awardBands,
         topAwards: topAwards,
         cadence: cadence,
+        periodStats: periodStats,
         periodTotals: periodTotals,
         periodCounts: periodCounts,
         periodEntries: orderedEntries,
@@ -735,6 +763,43 @@ func buildSummary(records: [Record], config: Config) -> Summary {
         yearTotals: yearTotals,
         yearPeriods: yearPeriods,
         periodDeltas: periodDeltas
+    )
+}
+
+func buildPeriodStats(entries: [PeriodEntry], totals: [String: Double]) -> PeriodStats {
+    let values = entries.map { totals[$0.key] ?? 0 }
+    let average = values.isEmpty ? 0 : values.reduce(0, +) / Double(values.count)
+    let median = computeMedian(values: values)
+    let stdDev = computeStdDev(values: values)
+    let coeffVar = average > 0 ? stdDev / average : 0
+    let minValue = values.min() ?? 0
+    let maxValue = values.max() ?? 0
+
+    let recentCount = min(3, entries.count)
+    var recentAverage: Double?
+    var recentMomentum: Double?
+    var recentPeriods: [String] = []
+    if recentCount > 0 {
+        let recentEntries = entries.suffix(recentCount)
+        recentPeriods = recentEntries.map { $0.key }
+        let recentTotal = recentEntries.reduce(0.0) { $0 + (totals[$1.key] ?? 0) }
+        let averageRecent = recentTotal / Double(recentCount)
+        recentAverage = averageRecent
+        if average > 0 {
+            recentMomentum = averageRecent / average
+        }
+    }
+
+    return PeriodStats(
+        average: average,
+        median: median,
+        stdDev: stdDev,
+        coeffVar: coeffVar,
+        min: minValue,
+        max: maxValue,
+        recentAverage: recentAverage,
+        recentMomentum: recentMomentum,
+        recentPeriods: recentPeriods
     )
 }
 
@@ -1163,6 +1228,17 @@ func exportReport(summary: Summary, config: Config, to path: String) throws {
             awardStdDev: summary.awardStdDev,
             awardCoeffVar: summary.awardCoeffVar
         ),
+        periodStats: ExportPeriodStats(
+            average: summary.periodStats.average,
+            median: summary.periodStats.median,
+            stdDev: summary.periodStats.stdDev,
+            coeffVar: summary.periodStats.coeffVar,
+            min: summary.periodStats.min,
+            max: summary.periodStats.max,
+            recentAverage: summary.periodStats.recentAverage,
+            recentMomentum: summary.periodStats.recentMomentum,
+            recentPeriods: summary.periodStats.recentPeriods
+        ),
         cadence: summary.cadence.gapCount > 0 ? ExportCadence(
             gapCount: summary.cadence.gapCount,
             averageGapDays: summary.cadence.averageGapDays,
@@ -1274,6 +1350,17 @@ func printReport(summary: Summary, config: Config) {
     print(String(format: "Median award: $%.2f", summary.medianAward))
     print(String(format: "Award std dev: $%.2f", summary.awardStdDev))
     print(String(format: "Award coeff var: %.2f", summary.awardCoeffVar))
+    print(String(format: "Period avg: $%.2f", summary.periodStats.average))
+    print(String(format: "Period median: $%.2f", summary.periodStats.median))
+    print(String(format: "Period std dev: $%.2f", summary.periodStats.stdDev))
+    print(String(format: "Period coeff var: %.2f", summary.periodStats.coeffVar))
+    print(String(format: "Period range: $%.2f - $%.2f", summary.periodStats.min, summary.periodStats.max))
+    if let recentAverage = summary.periodStats.recentAverage {
+        print(String(format: "Recent period avg: $%.2f", recentAverage))
+    }
+    if let momentum = summary.periodStats.recentMomentum {
+        print(String(format: "Recent momentum: %.0f%% of overall avg", momentum * 100))
+    }
     if summary.cadence.gapCount > 0 {
         print(String(format: "Award cadence avg gap: %.1f days", summary.cadence.averageGapDays ?? 0))
         print(String(format: "Award cadence median gap: %.1f days", summary.cadence.medianGapDays ?? 0))
@@ -1697,6 +1784,14 @@ func syncToDatabase(summary: Summary, config: Config) throws {
         median_award NUMERIC NOT NULL,
         award_std_dev NUMERIC NOT NULL,
         award_coeff_var NUMERIC NOT NULL,
+        period_avg NUMERIC NOT NULL,
+        period_median NUMERIC NOT NULL,
+        period_std_dev NUMERIC NOT NULL,
+        period_coeff_var NUMERIC NOT NULL,
+        period_min NUMERIC NOT NULL,
+        period_max NUMERIC NOT NULL,
+        recent_period_avg NUMERIC NOT NULL,
+        recent_period_momentum NUMERIC NOT NULL,
         top_award_share NUMERIC NOT NULL,
         top_five_share NUMERIC NOT NULL,
         gap_count INTEGER NOT NULL,
@@ -1826,6 +1921,14 @@ func syncToDatabase(summary: Summary, config: Config) throws {
     try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS median_award NUMERIC NOT NULL DEFAULT 0;").wait()
     try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS award_std_dev NUMERIC NOT NULL DEFAULT 0;").wait()
     try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS award_coeff_var NUMERIC NOT NULL DEFAULT 0;").wait()
+    try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS period_avg NUMERIC NOT NULL DEFAULT 0;").wait()
+    try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS period_median NUMERIC NOT NULL DEFAULT 0;").wait()
+    try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS period_std_dev NUMERIC NOT NULL DEFAULT 0;").wait()
+    try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS period_coeff_var NUMERIC NOT NULL DEFAULT 0;").wait()
+    try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS period_min NUMERIC NOT NULL DEFAULT 0;").wait()
+    try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS period_max NUMERIC NOT NULL DEFAULT 0;").wait()
+    try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS recent_period_avg NUMERIC NOT NULL DEFAULT 0;").wait()
+    try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS recent_period_momentum NUMERIC NOT NULL DEFAULT 0;").wait()
     try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS top_award_share NUMERIC NOT NULL DEFAULT 0;").wait()
     try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS top_five_share NUMERIC NOT NULL DEFAULT 0;").wait()
     try connection.simpleQuery("ALTER TABLE \(schema).snapshots ADD COLUMN IF NOT EXISTS weighted_expected_total NUMERIC NOT NULL DEFAULT 0;").wait()
@@ -1856,14 +1959,20 @@ func syncToDatabase(summary: Summary, config: Config) throws {
     INSERT INTO \(schema).snapshots
         (snapshot_id, generated_at, period_type, annual_budget, start_date, end_date, total_records, total_amount, expected_total, variance,
          weighted_expected_total, weighted_variance, weighted_pace,
-         average_award, median_award, award_std_dev, award_coeff_var, top_award_share, top_five_share, gap_count, average_gap_days,
+         average_award, median_award, award_std_dev, award_coeff_var,
+         period_avg, period_median, period_std_dev, period_coeff_var, period_min, period_max, recent_period_avg, recent_period_momentum,
+         top_award_share, top_five_share, gap_count, average_gap_days,
          median_gap_days, max_gap_days, recent_gap_days, filters_json)
     VALUES
         ('\(snapshotId)'::uuid, '\(sqlTimestamp(generatedAt))', '\(sqlLiteral(summary.periodType.rawValue))', \(sqlDecimal(config.annualBudget)),
          '\(sqlDate(summary.startDate))', '\(sqlDate(summary.endDate))', \(summary.totalRecords), \(sqlDecimal(summary.totalAmount)),
          \(sqlDecimal(expectedTotal)), \(sqlDecimal(variance)), \(sqlDecimal(weightedExpectedTotal)), \(sqlDecimal(weightedVariance)),
          \(sqlDecimal(weightedPace)), \(sqlDecimal(summary.averageAward)), \(sqlDecimal(summary.medianAward)),
-         \(sqlDecimal(summary.awardStdDev)), \(sqlDecimal(summary.awardCoeffVar)), \(sqlDecimal(summary.topAwardShare)), \(sqlDecimal(summary.topFiveShare)),
+         \(sqlDecimal(summary.awardStdDev)), \(sqlDecimal(summary.awardCoeffVar)),
+         \(sqlDecimal(summary.periodStats.average)), \(sqlDecimal(summary.periodStats.median)), \(sqlDecimal(summary.periodStats.stdDev)),
+         \(sqlDecimal(summary.periodStats.coeffVar)), \(sqlDecimal(summary.periodStats.min)), \(sqlDecimal(summary.periodStats.max)),
+         \(sqlDecimal(summary.periodStats.recentAverage ?? 0)), \(sqlDecimal(summary.periodStats.recentMomentum ?? 0)),
+         \(sqlDecimal(summary.topAwardShare)), \(sqlDecimal(summary.topFiveShare)),
          \(summary.cadence.gapCount), \(sqlDecimal(summary.cadence.averageGapDays ?? 0)), \(sqlDecimal(summary.cadence.medianGapDays ?? 0)),
          \(summary.cadence.maxGapDays ?? 0), \(summary.cadence.recentGapDays ?? 0),
          '\(sqlLiteral(filtersJson))');

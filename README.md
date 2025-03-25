@@ -18,6 +18,7 @@ A Swift CLI for tracking scholarship award disbursement pacing against an annual
 - Award size volatility (std dev and coefficient of variation)
 - Award concentration risk (top award and top 5 share)
 - Award cadence metrics (average/median gap between award days)
+- Period consistency stats (avg/median/min/max, volatility, recent momentum)
 - Award size band distribution and top award highlights
 - Period weights for seasonality-adjusted expectations and alerts
 - Top category and cohort spend mix
